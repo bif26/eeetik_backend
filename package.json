@@ -4,6 +4,9 @@
   "description": "",
   "author": "",
   "private": true,
+  "engines": {
+    "node": "22.x"
+  },
   "license": "UNLICENSED",
   "scripts": {
     "build": "npm run build:shared && npm run build:api && npm run build:worker",

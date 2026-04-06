@@ -208,6 +208,7 @@ This repo supports deploying two Heroku apps from the same codebase:
    cp infra/heroku/shared-services.env.example infra/heroku/shared-services.env
    ```
    Fill `infra/heroku/shared-services.env` with your external MongoDB URI and R2/CDN signing secrets.
+   Use real values only (no angle-bracket placeholders like `<username>` or `<accountid>`).
 3. Provision shared services and set shared secrets/env vars on both apps:
    ```bash
    infra/heroku/provision-shared-services.sh <api-app-name> <worker-app-name> infra/heroku/shared-services.env
@@ -222,6 +223,8 @@ This repo supports deploying two Heroku apps from the same codebase:
    infra/heroku/deploy-api.sh <api-app-name>
    infra/heroku/deploy-worker.sh <worker-app-name>
    ```
+   If Docker is installed and running, the scripts use container deployment.
+   If Docker is unavailable, they automatically fall back to Heroku Git deployment.
 5. Configure custom app domains:
    ```bash
    infra/heroku/configure-domains.sh <api-app-name> <worker-app-name>

@@ -18,10 +18,44 @@ fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-set -a
-# shellcheck disable=SC1090
-source "$shared_env_file"
-set +a
+load_env_file() {
+  local env_file_path="$1"
+  local line_number=0
+  while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+    line_number=$((line_number + 1))
+    local line="${raw_line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    if [ -z "$line" ] || [[ "$line" == \#* ]]; then
+      continue
+    fi
+
+    if [[ "$line" != *=* ]]; then
+      echo "Invalid env line ${line_number} in ${env_file_path}: ${raw_line}"
+      echo "Expected KEY=value format."
+      exit 1
+    fi
+
+    local key="${line%%=*}"
+    local value="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    value="${value#"${value%%[![:space:]]*}"}"
+
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "Invalid env key '${key}' on line ${line_number} in ${env_file_path}"
+      exit 1
+    fi
+
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+      value="${value:1:${#value}-2}"
+    elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+
+    export "${key}=${value}"
+  done < "$env_file_path"
+}
+
+load_env_file "$shared_env_file"
 
 required_vars=(
   MONGO_URI
@@ -38,6 +72,11 @@ for env_key in "${required_vars[@]}"; do
   env_value="${!env_key:-}"
   if [ -z "$env_value" ]; then
     echo "Missing required ${env_key} in ${shared_env_file}"
+    exit 1
+  fi
+  if [[ "$env_value" == *"<"* || "$env_value" == *">"* || "$env_value" == "replace-me" ]]; then
+    echo "Invalid placeholder value for ${env_key} in ${shared_env_file}: ${env_value}"
+    echo "Set a real value before running provisioning."
     exit 1
   fi
 done

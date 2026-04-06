@@ -2,7 +2,7 @@ import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectModel } from '@nestjs/mongoose';
 import { DownloadLog, DownloadStatus, getStructuredLogger } from '@shared';
-import { Model } from 'mongoose';
+import { Model, Types } from 'mongoose';
 import { WorkerObjectStorageService } from './worker-object-storage.service';
 
 const DEFAULT_STORAGE_CLEANUP_INTERVAL_MINUTES = 30;
@@ -11,7 +11,7 @@ const EXPIRED_DOWNLOAD_MESSAGE =
   'Download asset expired after retention window';
 
 interface ExpiredDownloadCandidate {
-  _id: string;
+  _id: Types.ObjectId;
   jobId: string;
   uniqueId: string;
   storageKey: string;
