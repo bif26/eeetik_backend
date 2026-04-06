@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: eeetik-worker
-  namespace: eeetik
+  namespace: eeetik-backend
 spec:
   replicas: 2
   revisionHistoryLimit: 3
@@ -25,9 +25,9 @@ spec:
           imagePullPolicy: Always
           envFrom:
             - configMapRef:
-                name: eeetik-config
+                name: eeetik-backend-config
             - secretRef:
-                name: eeetik-secrets
+                name: eeetik-backend-secret
           resources:
             requests:
               cpu: 250m
@@ -35,3 +35,4 @@ spec:
             limits:
               cpu: "2"
               memory: 2Gi
+

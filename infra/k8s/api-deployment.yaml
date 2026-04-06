@@ -2,9 +2,9 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: eeetik-api
-  namespace: eeetik
+  namespace: eeetik-backend
 spec:
-  replicas: 3
+  replicas: 2
   revisionHistoryLimit: 3
   strategy:
     type: RollingUpdate
@@ -27,9 +27,9 @@ spec:
             - containerPort: 3000
           envFrom:
             - configMapRef:
-                name: eeetik-config
+                name: eeetik-backend-config
             - secretRef:
-                name: eeetik-secrets
+                name: eeetik-backend-secret
           readinessProbe:
             httpGet:
               path: /api/v2/health/ready
@@ -49,3 +49,4 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
+

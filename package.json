@@ -21,7 +21,6 @@
     "start:worker:dev": "nest start worker --watch",
     "start:prod": "node dist/apps/eeetik_backend/main",
     "start:worker:prod": "node dist/apps/worker/main",
-    "heroku-postbuild": "npm run build",
     "lint": "eslint \"{apps,libs}/**/*.ts\" --fix",
     "test": "jest",
     "test:watch": "jest --watch",

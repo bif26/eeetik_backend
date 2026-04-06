@@ -4,13 +4,12 @@ import {
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
-import { buildSignedCdnUrl } from '@shared';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PassThrough, Readable } from 'node:stream';
 
 const DEFAULT_SIGNED_URL_TTL_SECONDS = 600;
-const SIGNED_URL_MODE_CDN = 'cdn';
 
 @Injectable()
 export class WorkerObjectStorageService {
@@ -18,18 +17,22 @@ export class WorkerObjectStorageService {
   private readonly bucketName: string;
 
   constructor(private readonly configService: ConfigService) {
-    this.bucketName = this.configService.get<string>('R2_BUCKET', '');
+    this.bucketName = this.configService.get<string>('S3_BUCKET', '');
+    const endpoint = this.configService.get<string>('S3_ENDPOINT');
+    const useSSL = this.configService.get<string>('S3_USE_SSL', 'false');
+    
     this.s3Client = new S3Client({
-      endpoint: this.configService.get<string>('R2_ENDPOINT'),
-      region: this.configService.get<string>('R2_REGION', 'auto'),
+      endpoint: endpoint,
+      region: this.configService.get<string>('S3_REGION', 'us-east-1'),
       credentials: {
-        accessKeyId: this.configService.get<string>('R2_ACCESS_KEY_ID', ''),
+        accessKeyId: this.configService.get<string>('S3_ACCESS_KEY_ID', ''),
         secretAccessKey: this.configService.get<string>(
-          'R2_SECRET_ACCESS_KEY',
+          'S3_SECRET_ACCESS_KEY',
           '',
         ),
       },
-      forcePathStyle: false,
+      forcePathStyle: true, // Required for MinIO
+      tls: useSSL.toLowerCase() === 'true',
     });
   }
 
@@ -99,50 +102,22 @@ export class WorkerObjectStorageService {
     return Buffer.concat(chunks);
   }
 
-  getSignedUrl(key: string, expiresInSeconds?: number): Promise<string> {
+  async getSignedUrl(key: string, expiresInSeconds?: number): Promise<string> {
     const signedUrlTtl =
       expiresInSeconds ??
       this.readPositiveIntegerConfig(
         'SIGNED_URL_TTL_SECONDS',
         DEFAULT_SIGNED_URL_TTL_SECONDS,
       );
-    const signedUrlMode = this.configService
-      .get<string>('SIGNED_URL_MODE', SIGNED_URL_MODE_CDN)
-      .toLowerCase()
-      .trim();
 
-    if (signedUrlMode !== SIGNED_URL_MODE_CDN) {
-      throw new Error(
-        'SIGNED_URL_MODE must be "cdn". Direct R2 signed URLs are disabled.',
-      );
-    }
+    const command = new GetObjectCommand({
+      Bucket: this.bucketName,
+      Key: key,
+    });
 
-    const cdnBaseUrl = this.configService.get<string>(
-      'CDN_SIGNED_BASE_URL',
-      '',
-    );
-    const cdnSigningSecret = this.configService.get<string>(
-      'CDN_SIGNING_SECRET',
-      '',
-    );
-    if (!cdnBaseUrl.trim() || !cdnSigningSecret.trim()) {
-      throw new Error(
-        'CDN_SIGNED_BASE_URL and CDN_SIGNING_SECRET are required when SIGNED_URL_MODE=cdn',
-      );
-    }
-
-    return Promise.resolve(
-      buildSignedCdnUrl({
-        baseUrl: cdnBaseUrl,
-        signingSecret: cdnSigningSecret,
-        objectKey: key,
-        expiresInSeconds: signedUrlTtl,
-        pathPrefix: this.configService.get<string>(
-          'CDN_SIGNED_PATH_PREFIX',
-          '/media',
-        ),
-      }),
-    );
+    return getSignedUrl(this.s3Client, command, {
+      expiresIn: signedUrlTtl,
+    });
   }
 
   async deleteObject(key: string): Promise<void> {

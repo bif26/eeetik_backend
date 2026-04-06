@@ -5,7 +5,7 @@ Secure and scalable NestJS backend for TikTok metadata + download workflows with
 - Worker app (`apps/worker`) using BullMQ
 - Redis cache + queue
 - MongoDB persistence
-- Private Cloudflare R2 media storage with signed URLs
+- MinIO S3-compatible object storage for media files
 - Ad-gated download flow (Google AdSense + Google Tag Manager policy integration)
 
 ## Architecture
@@ -15,8 +15,8 @@ Secure and scalable NestJS backend for TikTok metadata + download workflows with
 - **Worker service**: background media transfer, ZIP generation, signed URL issuance
 - **Redis**: metadata cache and BullMQ transport
 - **MongoDB**: metadata + download logs
-- **R2**: private media object storage
-- **Cloudflare**: edge proxy, WAF, DDoS shielding, origin protection
+- **MinIO**: S3-compatible self-hosted object storage
+- **Cloudflare** (optional): edge proxy, WAF, DDoS shielding
 
 ### Sequence flow
 
@@ -29,7 +29,7 @@ sequenceDiagram
     participant MongoDB
     participant Scraper as @tobyg74/tiktok-api-dl
     participant Bull as BullMQ Worker
-    participant R2 as Cloudflare R2
+    participant R2 as MinIO Storage
     participant TikTok as TikTok CDN
 
     User->>Frontend: Paste TikTok URL
@@ -63,7 +63,7 @@ sequenceDiagram
       Bull->>Bull: Build ZIP archive
       Bull->>R2: Upload ZIP
     end
-    Bull->>Backend: Generate signed CDN URL (short TTL)
+    Bull->>Backend: Generate presigned S3 URL (short TTL)
     Bull->>MongoDB: Update download_log(status=completed, downloadUrl)
 
     Frontend->>Backend: GET /api/v2/model/download/tiktok/status/:jobId
@@ -177,7 +177,7 @@ Run e2e load validation against real TikTok + R2 + CDN setup:
 LOADTEST_MODE=e2e BASE_URL=https://api.eeetik.app SAMPLE_TIKTOK_URL=https://www.tiktok.com/@.../video/... npm run loadtest:k6:e2e
 ```
 
-Set `STORAGE_MAX_MONTHLY_BYTES` to your Cloudflare R2 free-tier or paid-tier policy before running production traffic. When current-month storage usage reaches this limit, new prepare requests are paused until the limit is increased.
+Set `STORAGE_MAX_MONTHLY_BYTES` to your storage policy limit before running production traffic. When current-month storage usage reaches this limit, new prepare requests are paused until the limit is increased.
 
 ## Container images
 
@@ -189,119 +189,54 @@ docker build -f Dockerfile.api -t eeetik-api .
 docker build -f Dockerfile.worker -t eeetik-worker .
 ```
 
-## Heroku split deployment (API + worker)
-
-This repo supports deploying two Heroku apps from the same codebase:
-- API app domain: `https://api.eeetik.app`
-- Worker app domain policy: `https://api1.eeetik.app`
-- Signed media CDN domain: `https://cdn.eeetik.app`
-
-1. Create two Heroku apps and switch both to container stack:
-   ```bash
-   heroku apps:create <api-app-name>
-   heroku apps:create <worker-app-name>
-   heroku stack:set container -a <api-app-name>
-   heroku stack:set container -a <worker-app-name>
-   ```
-2. Prepare a private shared-services env file from template:
-   ```bash
-   cp infra/heroku/shared-services.env.example infra/heroku/shared-services.env
-   ```
-   Fill `infra/heroku/shared-services.env` with your external MongoDB URI and R2/CDN signing secrets.
-   Use real values only (no angle-bracket placeholders like `<username>` or `<accountid>`).
-3. Provision shared services and set shared secrets/env vars on both apps:
-   ```bash
-   infra/heroku/provision-shared-services.sh <api-app-name> <worker-app-name> infra/heroku/shared-services.env
-   ```
-   Add a 4th argument to override Redis plan (default: `heroku-redis:mini`).
-    - Adds/reuses Heroku Redis on the API app and mirrors `REDIS_*` + `THROTTLE_REDIS_*` to both apps.
-    - Applies fixed CDN/domain defaults (`SIGNED_URL_MODE=cdn`, `api.eeetik.app`, `api1.eeetik.app`, `cdn.eeetik.app`).
-    - Applies shared runtime vars (`MONGO_URI`, `R2_*`, `CDN_SIGNING_SECRET`) to both apps.
-    - Keeps media delivery CDN-only (signed `cdn.eeetik.app` URLs, never direct object-storage download hosts).
-4. Deploy API and worker images:
-   ```bash
-   infra/heroku/deploy-api.sh <api-app-name>
-   infra/heroku/deploy-worker.sh <worker-app-name>
-   ```
-   If Docker is installed and running, the scripts use container deployment.
-   If Docker is unavailable, they automatically fall back to Heroku Git deployment.
-5. Configure custom app domains:
-   ```bash
-   infra/heroku/configure-domains.sh <api-app-name> <worker-app-name>
-   ```
-6. Verify both apps are in sync:
-   ```bash
-   infra/heroku/check-shared-config.sh <api-app-name> <worker-app-name>
-   ```
-7. Configure `cdn.eeetik.app` in Cloudflare to your signed-media edge/origin path.
-8. Run the production smoke check:
-   ```bash
-   infra/heroku/smoke-download-flow.sh
-   ```
-   Optional overrides:
-   ```bash
-   API_BASE_URL=https://api.eeetik.app ORIGIN_HEADER=https://eeetik.app SAMPLE_TIKTOK_URL=https://www.tiktok.com/@.../video/... infra/heroku/smoke-download-flow.sh
-   ```
-
-> Note: the worker app runs background jobs and typically does not serve public HTTP routes. Keep `api1.eeetik.app` as the worker app domain policy unless you intentionally add a web process.
-
-### Heroku rollback runbook (split API + worker)
-
-1. Check recent releases on each app:
-   ```bash
-   heroku releases -a <api-app-name>
-   heroku releases -a <worker-app-name>
-   ```
-2. Roll back quickly to known-good release numbers if needed:
-   ```bash
-   heroku releases:rollback v<api-release> -a <api-app-name>
-   heroku releases:rollback v<worker-release> -a <worker-app-name>
-   ```
-3. If you need to rebuild from a known-good commit, deploy each app with existing scripts:
-   ```bash
-   git checkout <known-good-commit>
-   infra/heroku/deploy-api.sh <api-app-name>
-   infra/heroku/deploy-worker.sh <worker-app-name>
-   git checkout -
-   ```
-4. Re-validate after rollback:
-   ```bash
-   infra/heroku/check-shared-config.sh <api-app-name> <worker-app-name>
-   infra/heroku/smoke-download-flow.sh
-   ```
-
 ## Kubernetes deployment
 
-Manifest templates are in `infra/k8s/`:
-- `namespace.yaml`
-- `configmap.yaml`
-- `secret.template.yaml`
-- `api-deployment.yaml`
-- `api-service.yaml`
-- `worker-deployment.yaml`
-- `hpa.yaml`
-- `ingress.yaml`
+**Complete deployment guide**: See [`docs/kubernetes-deployment.md`](docs/kubernetes-deployment.md)
 
-Apply in order after replacing placeholder values:
+The application can be deployed to any Kubernetes cluster (DigitalOcean, AWS EKS, GKE, bare metal, etc.) with self-hosted MinIO storage.
 
-```bash
-kubectl apply -f infra/k8s/namespace.yaml
-kubectl apply -f infra/k8s/configmap.yaml
-kubectl apply -f infra/k8s/secret.template.yaml
-kubectl apply -f infra/k8s/api-deployment.yaml
-kubectl apply -f infra/k8s/api-service.yaml
-kubectl apply -f infra/k8s/worker-deployment.yaml
-kubectl apply -f infra/k8s/hpa.yaml
-kubectl apply -f infra/k8s/ingress.yaml
-```
+### Quick deployment
+
+1. Build and push Docker images:
+   ```bash
+   docker build -f Dockerfile.api -t <your-registry>/eeetik-backend-api:latest .
+   docker build -f Dockerfile.worker -t <your-registry>/eeetik-backend-worker:latest .
+   docker push <your-registry>/eeetik-backend-api:latest
+   docker push <your-registry>/eeetik-backend-worker:latest
+   ```
+
+2. Update image references in deployment manifests:
+   - `infra/k8s/api-deployment.yaml`
+   - `infra/k8s/worker-deployment.yaml`
+
+3. Configure secrets and domain:
+   - Edit `infra/k8s/secret.template.yaml` with secure credentials
+   - Edit `infra/k8s/configmap.yaml` with your domain
+   - Edit `infra/k8s/ingress.yaml` with your API domain
+
+4. Deploy:
+   ```bash
+   chmod +x infra/k8s/deploy.sh
+   ./infra/k8s/deploy.sh
+   ```
+
+The deployment includes:
+- API and Worker services
+- MongoDB with persistent storage
+- Redis with persistent storage
+- MinIO (S3-compatible storage) with persistent storage
+- Horizontal Pod Autoscaling
+- Ingress for external access
+
+**For detailed instructions, cloud-specific guides, and troubleshooting**, see [`docs/kubernetes-deployment.md`](docs/kubernetes-deployment.md).
 
 ## Security notes
 
-- Keep R2 bucket private; expose only signed URLs.
-- Use `SIGNED_URL_MODE=cdn` and set `CDN_SIGNED_BASE_URL=https://cdn.eeetik.app`.
-- Disable any R2 public development URL and anonymous object access.
-- Route traffic through Cloudflare and restrict origin access to Cloudflare paths only.
-- Use managed Redis/Mongo endpoints in deployed environments (no `127.0.0.1`/`localhost`).
-- Do not expose direct object-storage download hosts (for example `*.r2.dev`, `*.cloudflarestorage.com`, `*.amazonaws.com`).
+- Keep MinIO bucket private; expose only presigned URLs.
+- Use `S3_USE_SSL=true` in production with proper TLS configuration.
+- Set strong MinIO credentials (change default `minioadmin` values).
+- Route traffic through load balancer/ingress with TLS.
+- Use managed Redis/Mongo endpoints in deployed environments.
 - Set strict `SITE_DOMAIN_ALLOWLIST` and `CORS_ORIGINS` for your frontend domain(s).
 - Keep secrets in Kubernetes secrets or cloud secret manager, not in source code.
+- Regularly rotate access credentials and update persistent volumes backup strategy.

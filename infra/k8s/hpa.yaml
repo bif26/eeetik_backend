@@ -2,13 +2,13 @@ apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: eeetik-api-hpa
-  namespace: eeetik
+  namespace: eeetik-backend
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
     name: eeetik-api
-  minReplicas: 3
+  minReplicas: 2
   maxReplicas: 20
   metrics:
     - type: Resource
@@ -22,7 +22,7 @@ apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: eeetik-worker-hpa
-  namespace: eeetik
+  namespace: eeetik-backend
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
@@ -37,3 +37,4 @@ spec:
         target:
           type: Utilization
           averageUtilization: 70
+
