@@ -2,9 +2,10 @@
 
 This guide explains how to set up automated Docker image builds and Kubernetes deployments using GitHub Actions.
 
-## Overview
+## Overview ok
 
 The CI/CD pipeline automatically:
+
 1. **Builds Docker images** when code is pushed to main/master branch
 2. **Pushes images to Docker Hub** with version tags
 3. **Optionally deploys to Kubernetes** (if configured)
@@ -35,11 +36,13 @@ The CI/CD pipeline automatically:
 The workflow file is located at `.github/workflows/docker-build-push.yml`
 
 **Workflow triggers:**
+
 - Push to `main` or `master` branch
 - Pull requests (builds but doesn't push)
 - Manual trigger via GitHub Actions UI
 
 **What it does:**
+
 - Builds `bif12/eeetik-backend-api` and `bif12/eeetik-backend-worker`
 - Tags images with:
   - `latest` (for main branch)
@@ -71,6 +74,7 @@ The workflow file is located at `.github/workflows/docker-build-push.yml`
 ### Update Deployment Files
 
 Edit `infra/k8s/api-deployment.yaml`:
+
 ```yaml
 spec:
   template:
@@ -78,10 +82,11 @@ spec:
       containers:
         - name: api
           image: bif12/eeetik-backend-api:latest
-          imagePullPolicy: Always  # Always pull latest image
+          imagePullPolicy: Always # Always pull latest image
 ```
 
 Edit `infra/k8s/worker-deployment.yaml`:
+
 ```yaml
 spec:
   template:
@@ -114,19 +119,18 @@ If you want to automatically deploy to Kubernetes after building images, follow 
 
 1. Add Kubernetes credentials to GitHub Secrets:
    - `KUBE_CONFIG`: Base64-encoded kubeconfig file
-   
 2. Update the workflow (add to end of `docker-build-push.yml`):
 
 ```yaml
-      - name: Deploy to Kubernetes
-        if: github.ref == 'refs/heads/main'
-        run: |
-          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > kubeconfig.yaml
-          export KUBECONFIG=./kubeconfig.yaml
-          kubectl rollout restart deployment/eeetik-api -n eeetik-backend
-          kubectl rollout restart deployment/eeetik-worker -n eeetik-backend
-          kubectl rollout status deployment/eeetik-api -n eeetik-backend
-          kubectl rollout status deployment/eeetik-worker -n eeetik-backend
+- name: Deploy to Kubernetes
+  if: github.ref == 'refs/heads/main'
+  run: |
+    echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > kubeconfig.yaml
+    export KUBECONFIG=./kubeconfig.yaml
+    kubectl rollout restart deployment/eeetik-api -n eeetik-backend
+    kubectl rollout restart deployment/eeetik-worker -n eeetik-backend
+    kubectl rollout status deployment/eeetik-api -n eeetik-backend
+    kubectl rollout status deployment/eeetik-worker -n eeetik-backend
 ```
 
 ### Option B: Using ArgoCD (GitOps - Recommended)
@@ -139,6 +143,7 @@ For production deployments, consider using ArgoCD for GitOps:
 4. No need to modify GitHub Actions - it just builds images
 
 **Benefits:**
+
 - Declarative deployments
 - Easy rollbacks
 - Audit trail
@@ -183,16 +188,19 @@ This ensures you know exactly which code version is running.
 ### Common Issues
 
 **Docker Hub login fails:**
+
 - Verify `DOCKER_HUB_TOKEN` secret is set correctly
 - Check token hasn't expired
 - Ensure username is correct (`bif12`)
 
 **Build fails:**
+
 - Check the build logs in GitHub Actions
 - Verify Dockerfiles are correct
 - Ensure all dependencies are available
 
 **Images not updating in Kubernetes:**
+
 - Check `imagePullPolicy` is set to `Always`
 - Manually restart deployment: `kubectl rollout restart`
 - Verify image tag is correct
@@ -217,11 +225,12 @@ For deploying to multiple environments (dev, staging, prod):
    - `v*` tag → production environment
 
 Example:
+
 ```yaml
 on:
   push:
     tags:
-      - 'v*'  # Trigger on version tags like v1.0.0
+      - 'v*' # Trigger on version tags like v1.0.0
 ```
 
 ## Getting Kubeconfig (for Option A above)
@@ -255,6 +264,7 @@ docker run -p 3000:3000 bif12/eeetik-backend-api:test
 ## Support
 
 For issues with:
+
 - **GitHub Actions**: Check `.github/workflows/docker-build-push.yml`
 - **Docker builds**: Check `Dockerfile.api` and `Dockerfile.worker`
 - **Kubernetes deployment**: See `docs/kubernetes-deployment.md`
