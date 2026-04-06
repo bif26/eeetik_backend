@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json.schemastore.org/nest-cli",
+  "collection": "@nestjs/schematics",
+  "sourceRoot": "apps/eeetik_backend/src",
+  "compilerOptions": {
+    "deleteOutDir": true,
+    "webpack": true,
+    "tsConfigPath": "apps/eeetik_backend/tsconfig.app.json"
+  },
+  "monorepo": true,
+  "root": "apps/eeetik_backend",
+  "projects": {
+    "eeetik_backend": {
+      "type": "application",
+      "root": "apps/eeetik_backend",
+      "entryFile": "main",
+      "sourceRoot": "apps/eeetik_backend/src",
+      "compilerOptions": {
+        "tsConfigPath": "apps/eeetik_backend/tsconfig.app.json"
+      }
+    },
+    "shared": {
+      "type": "library",
+      "root": "libs/shared",
+      "entryFile": "index",
+      "sourceRoot": "libs/shared/src",
+      "compilerOptions": {
+        "tsConfigPath": "libs/shared/tsconfig.lib.json"
+      }
+    },
+    "worker": {
+      "type": "application",
+      "root": "apps/worker",
+      "entryFile": "main",
+      "sourceRoot": "apps/worker/src",
+      "compilerOptions": {
+        "tsConfigPath": "apps/worker/tsconfig.app.json"
+      }
+    }
+  }
+}

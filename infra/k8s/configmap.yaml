@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eeetik-config
+  namespace: eeetik
+data:
+  NODE_ENV: "production"
+  API_PREFIX: "api/v2"
+  PORT: "3000"
+  CORS_ORIGINS: "https://eeetik.app,https://www.eeetik.app"
+  SITE_DOMAIN_ALLOWLIST: "eeetik.app,www.eeetik.app"
+  THROTTLE_TTL_MS: "60000"
+  THROTTLE_LIMIT: "600"
+  REDIS_HOST: "redis-master.default.svc.cluster.local"
+  REDIS_PORT: "6379"
+  MONGO_URI: "mongodb://mongodb.default.svc.cluster.local:27017/eeetik"
+  METADATA_CACHE_TTL_SECONDS: "86400"
+  SIGNED_URL_MODE: "cdn"
+  SIGNED_URL_TTL_SECONDS: "600"
+  STORAGE_MAX_MONTHLY_BYTES: "10737418240"
+  CDN_SIGNED_BASE_URL: "https://cdn.eeetik.app"
+  CDN_PUBLIC_HOST: "cdn.eeetik.app"
+  CDN_SIGNED_PATH_PREFIX: "/media"
+  R2_REGION: "auto"
+  AD_HD_MIN_SECONDS: "30"
+  AD_SD_MIN_SECONDS: "15"
+  AD_AUDIO_MIN_SECONDS: "10"
+  AD_ZIP_MIN_SECONDS: "20"
