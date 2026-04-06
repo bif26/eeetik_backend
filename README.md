@@ -193,7 +193,23 @@ docker build -f Dockerfile.worker -t eeetik-worker .
 
 **Complete deployment guide**: See [`docs/kubernetes-deployment.md`](docs/kubernetes-deployment.md)
 
+**GitHub Actions CI/CD setup**: See [`docs/github-actions-setup.md`](docs/github-actions-setup.md)
+
 The application can be deployed to any Kubernetes cluster (DigitalOcean, AWS EKS, GKE, bare metal, etc.) with self-hosted MinIO storage.
+
+### Automated CI/CD with GitHub Actions
+
+The repository includes a GitHub Actions workflow that automatically:
+- Builds Docker images on every push to main branch
+- Pushes images to Docker Hub (`bif12/eeetik-backend-api` and `bif12/eeetik-backend-worker`)
+- Tags images with commit SHA for version tracking
+
+**Setup steps:**
+1. Create a Docker Hub access token
+2. Add `DOCKER_HUB_TOKEN` to GitHub repository secrets
+3. Push code to trigger automatic builds
+
+See [`docs/github-actions-setup.md`](docs/github-actions-setup.md) for detailed instructions.
 
 ### Quick deployment
 

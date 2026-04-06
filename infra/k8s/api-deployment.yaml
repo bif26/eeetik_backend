@@ -21,7 +21,7 @@ spec:
     spec:
       containers:
         - name: api
-          image: ghcr.io/<owner>/eeetik-backend-api:latest
+          image: bif12/eeetik-backend-api:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 3000

@@ -21,7 +21,7 @@ spec:
     spec:
       containers:
         - name: worker
-          image: ghcr.io/<owner>/eeetik-backend-worker:latest
+          image: bif12/eeetik-backend-worker:latest
           imagePullPolicy: Always
           envFrom:
             - configMapRef:
