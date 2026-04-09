@@ -3,6 +3,7 @@ import { InjectModel } from '@nestjs/mongoose';
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { ConfigService } from '@nestjs/config';
 import { Injectable, NotFoundException } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { Model } from 'mongoose';
 import {
   DOWNLOAD_QUEUE_NAME,
@@ -12,18 +13,34 @@ import {
   getStructuredLogger,
   PostType,
   PrepareDownloadJobData,
+  REDIS_CDN_PREFIX,
   TikTokMetadata,
 } from '@shared';
 import { WorkerMediaService } from '../services/worker-media.service';
 import { WorkerObjectStorageService } from '../services/worker-object-storage.service';
+import { WorkerRedisCacheService } from '../services/worker-redis-cache.service';
 
-const DEFAULT_SIGNED_URL_TTL_SECONDS = 600;
 const DEFAULT_STORAGE_RETENTION_HOURS = 72;
 const DEFAULT_STORAGE_MAX_MONTHLY_BYTES = 10 * 1024 * 1024 * 1024;
+const DEFAULT_DOWNLOAD_LOCK_TTL_MS = 15_000;
+const DEFAULT_DOWNLOAD_LOCK_WAIT_MS = 7_000;
+const DEFAULT_DOWNLOAD_LOCK_WAIT_POLL_MS = 250;
 
 interface CreatedDownloadAsset {
   storageKey: string;
   storageBytes: number;
+}
+
+interface CdnUrlCacheRecord {
+  uniqueId: string;
+  postType: PostType;
+  urls: {
+    hd?: string;
+    sd?: string;
+    audio?: string;
+    watermark?: string;
+  };
+  imageUrls: string[];
 }
 
 @Injectable()
@@ -38,6 +55,7 @@ export class DownloadPrepareProcessor extends WorkerHost {
     private readonly downloadLogModel: Model<DownloadLog>,
     private readonly workerMediaService: WorkerMediaService,
     private readonly workerObjectStorageService: WorkerObjectStorageService,
+    private readonly workerRedisCacheService: WorkerRedisCacheService,
     private readonly configService: ConfigService,
   ) {
     super();
@@ -77,12 +95,11 @@ export class DownloadPrepareProcessor extends WorkerHost {
       });
 
       const storageExpiresAt = this.getStorageExpirationDate();
-      const downloadUrl = await this.workerObjectStorageService.getSignedUrl(
-        storageKey,
-        this.readPositiveIntegerConfig(
-          'SIGNED_URL_TTL_SECONDS',
-          DEFAULT_SIGNED_URL_TTL_SECONDS,
-        ),
+      const { uniqueId: fileUniqueId, filename } =
+        this.workerObjectStorageService.parseStorageKey(storageKey);
+      const downloadUrl = this.workerObjectStorageService.getSignedUrl(
+        fileUniqueId,
+        filename,
       );
 
       await this.downloadLogModel
@@ -136,51 +153,83 @@ export class DownloadPrepareProcessor extends WorkerHost {
     requestType: DownloadRequestType,
   ): Promise<CreatedDownloadAsset> {
     if (requestType === DownloadRequestType.ZIP) {
-      return this.createZipAsset(metadata);
+      return this.withDownloadLock(
+        metadata.uniqueId,
+        requestType,
+        'images.zip',
+        async () => this.createZipAsset(metadata),
+      );
     }
 
     if (requestType === DownloadRequestType.AUDIO) {
-      if (!metadata.originalAudioUrl) {
-        throw new NotFoundException(
-          `Audio source URL is missing for uniqueId: ${metadata.uniqueId}`,
+      return this.withDownloadLock(
+        metadata.uniqueId,
+        requestType,
+        'audio.mp3',
+        async () => {
+          const filename = 'audio.mp3';
+          const existingAsset = await this.getExistingAsset(
+            metadata.uniqueId,
+            filename,
+          );
+          if (existingAsset) {
+            return existingAsset;
+          }
+
+          const sourceUrl = await this.resolveSourceUrl(
+            metadata,
+            DownloadRequestType.AUDIO,
+          );
+          const stream =
+            await this.workerMediaService.downloadAsStream(sourceUrl);
+          const storageBytes = await this.workerObjectStorageService.putStream(
+            metadata.uniqueId,
+            filename,
+            stream,
+          );
+          return {
+            storageKey: this.workerObjectStorageService.toStorageKey(
+              metadata.uniqueId,
+              filename,
+            ),
+            storageBytes,
+          };
+        },
+      );
+    }
+
+    const videoFilename =
+      requestType === DownloadRequestType.HD ? 'video-hd.mp4' : 'video-sd.mp4';
+    return this.withDownloadLock(
+      metadata.uniqueId,
+      requestType,
+      videoFilename,
+      async () => {
+        const existingAsset = await this.getExistingAsset(
+          metadata.uniqueId,
+          videoFilename,
         );
-      }
+        if (existingAsset) {
+          return existingAsset;
+        }
 
-      const audioKey = `downloads/${metadata.uniqueId}/audio.mp3`;
-      const stream = await this.workerMediaService.downloadAsStream(
-        metadata.originalAudioUrl,
-      );
-      const storageBytes = await this.workerObjectStorageService.putStream(
-        audioKey,
-        stream,
-        'audio/mpeg',
-      );
-      return {
-        storageKey: audioKey,
-        storageBytes,
-      };
-    }
-
-    if (!metadata.originalVideoUrl) {
-      throw new NotFoundException(
-        `Video source URL is missing for uniqueId: ${metadata.uniqueId}`,
-      );
-    }
-
-    const qualityFile = requestType === DownloadRequestType.HD ? 'hd' : 'sd';
-    const videoKey = `downloads/${metadata.uniqueId}/${qualityFile}.mp4`;
-    const stream = await this.workerMediaService.downloadAsStream(
-      metadata.originalVideoUrl,
+        const sourceUrl = await this.resolveSourceUrl(metadata, requestType);
+        const stream =
+          await this.workerMediaService.downloadAsStream(sourceUrl);
+        const storageBytes = await this.workerObjectStorageService.putStream(
+          metadata.uniqueId,
+          videoFilename,
+          stream,
+        );
+        return {
+          storageKey: this.workerObjectStorageService.toStorageKey(
+            metadata.uniqueId,
+            videoFilename,
+          ),
+          storageBytes,
+        };
+      },
     );
-    const storageBytes = await this.workerObjectStorageService.putStream(
-      videoKey,
-      stream,
-      'video/mp4',
-    );
-    return {
-      storageKey: videoKey,
-      storageBytes,
-    };
   }
 
   private async createZipAsset(
@@ -195,24 +244,224 @@ export class DownloadPrepareProcessor extends WorkerHost {
       );
     }
 
+    const zipFilename = 'images.zip';
+    const existingAsset = await this.getExistingAsset(
+      metadata.uniqueId,
+      zipFilename,
+    );
+    if (existingAsset) {
+      return existingAsset;
+    }
+
     const imageBuffers = await Promise.all(
-      metadata.imageKeys.map(async (key, index) => ({
-        name: `image-${index + 1}.webp`,
-        body: await this.workerObjectStorageService.getBuffer(key),
-      })),
+      metadata.imageKeys.map(async (key, index) => {
+        const filename = this.normalizeStoredFilename(
+          metadata.uniqueId,
+          key,
+          index,
+        );
+        return {
+          name: filename,
+          body: await this.workerObjectStorageService.getBuffer(
+            metadata.uniqueId,
+            filename,
+          ),
+        };
+      }),
     );
 
     const zipBuffer = await this.workerMediaService.buildZip(imageBuffers);
-    const zipKey = `downloads/${metadata.uniqueId}/images.zip`;
     const storageBytes = await this.workerObjectStorageService.putBuffer(
-      zipKey,
+      metadata.uniqueId,
+      zipFilename,
       zipBuffer,
-      'application/zip',
     );
     return {
-      storageKey: zipKey,
+      storageKey: this.workerObjectStorageService.toStorageKey(
+        metadata.uniqueId,
+        zipFilename,
+      ),
       storageBytes,
     };
+  }
+
+  private async getExistingAsset(
+    uniqueId: string,
+    filename: string,
+  ): Promise<CreatedDownloadAsset | null> {
+    const exists = await this.workerObjectStorageService.fileExists(
+      uniqueId,
+      filename,
+    );
+    if (!exists) {
+      return null;
+    }
+
+    const storageBytes = await this.workerObjectStorageService.getFileSize(
+      uniqueId,
+      filename,
+    );
+    return {
+      storageKey: this.workerObjectStorageService.toStorageKey(
+        uniqueId,
+        filename,
+      ),
+      storageBytes,
+    };
+  }
+
+  private async resolveSourceUrl(
+    metadata: TikTokMetadata,
+    requestType:
+      | DownloadRequestType.AUDIO
+      | DownloadRequestType.HD
+      | DownloadRequestType.SD,
+  ): Promise<string> {
+    const cachedCdn = await this.getCachedCdnUrls(metadata.uniqueId);
+    const sourceUrl =
+      requestType === DownloadRequestType.AUDIO
+        ? (cachedCdn?.urls.audio ?? metadata.originalAudioUrl)
+        : requestType === DownloadRequestType.HD
+          ? (cachedCdn?.urls.hd ?? metadata.originalVideoUrl)
+          : (cachedCdn?.urls.sd ?? metadata.originalVideoUrl);
+
+    if (!sourceUrl) {
+      throw new NotFoundException(
+        `Source URL is missing for uniqueId: ${metadata.uniqueId}, requestType: ${requestType}`,
+      );
+    }
+
+    return sourceUrl;
+  }
+
+  private async getCachedCdnUrls(
+    uniqueId: string,
+  ): Promise<CdnUrlCacheRecord | null> {
+    try {
+      return await this.workerRedisCacheService.get<CdnUrlCacheRecord>(
+        `${REDIS_CDN_PREFIX}${uniqueId}`,
+      );
+    } catch (error) {
+      this.logger.warn('download.cdn.cache_lookup_failed', {
+        uniqueId,
+        errorMessage: this.toErrorMessage(error),
+      });
+      return null;
+    }
+  }
+
+  private normalizeStoredFilename(
+    uniqueId: string,
+    keyOrFilename: string,
+    fallbackIndex: number,
+  ): string {
+    const trimmed = keyOrFilename.trim().replace(/^\/+/, '');
+    if (!trimmed.includes('/')) {
+      return trimmed;
+    }
+
+    const segments = trimmed.split('/').filter((segment) => segment.length > 0);
+    if (
+      segments[0] === 'metadata' &&
+      segments.length >= 4 &&
+      segments[1] === uniqueId &&
+      segments[2] === 'images'
+    ) {
+      const rawFilename = segments[3];
+      const ext = rawFilename.includes('.')
+        ? rawFilename.slice(rawFilename.lastIndexOf('.'))
+        : '.webp';
+      const stem = rawFilename.replace(/\.[^.]*$/, '');
+      const index = Number(stem);
+      if (Number.isFinite(index)) {
+        return `image-${Math.max(0, Math.floor(index))}${ext}`;
+      }
+
+      return `image-${fallbackIndex}.webp`;
+    }
+
+    if (segments[0] === uniqueId && segments.length >= 2) {
+      return segments[segments.length - 1];
+    }
+
+    return segments[segments.length - 1];
+  }
+
+  private async withDownloadLock(
+    uniqueId: string,
+    requestType: DownloadRequestType,
+    expectedFilename: string,
+    createAsset: () => Promise<CreatedDownloadAsset>,
+  ): Promise<CreatedDownloadAsset> {
+    const lockTtlMs = this.readPositiveIntegerConfig(
+      'DOWNLOAD_LOCK_TTL_MS',
+      DEFAULT_DOWNLOAD_LOCK_TTL_MS,
+    );
+    const lockWaitMs = this.readPositiveIntegerConfig(
+      'DOWNLOAD_LOCK_WAIT_MS',
+      DEFAULT_DOWNLOAD_LOCK_WAIT_MS,
+    );
+    const lockWaitPollMs = this.readPositiveIntegerConfig(
+      'DOWNLOAD_LOCK_WAIT_POLL_MS',
+      DEFAULT_DOWNLOAD_LOCK_WAIT_POLL_MS,
+    );
+    const lockKey = `download:prepare:lock:${uniqueId}:${requestType}`;
+    const lockToken = randomUUID();
+    const hasLock = await this.workerRedisCacheService.acquireLock(
+      lockKey,
+      lockToken,
+      lockTtlMs,
+    );
+
+    if (!hasLock) {
+      const waitedAsset = await this.waitForExistingAsset(
+        uniqueId,
+        expectedFilename,
+        lockWaitMs,
+        lockWaitPollMs,
+      );
+      if (waitedAsset) {
+        return waitedAsset;
+      }
+
+      throw new Error(
+        `Another prepare request is already processing ${uniqueId}/${expectedFilename}`,
+      );
+    }
+
+    try {
+      return await createAsset();
+    } finally {
+      try {
+        await this.workerRedisCacheService.releaseLock(lockKey, lockToken);
+      } catch (error) {
+        this.logger.warn('download.lock.release_failed', {
+          uniqueId,
+          requestType,
+          lockKey,
+          errorMessage: this.toErrorMessage(error),
+        });
+      }
+    }
+  }
+
+  private async waitForExistingAsset(
+    uniqueId: string,
+    filename: string,
+    waitMs: number,
+    pollMs: number,
+  ): Promise<CreatedDownloadAsset | null> {
+    const deadlineAt = Date.now() + waitMs;
+    while (Date.now() < deadlineAt) {
+      const existingAsset = await this.getExistingAsset(uniqueId, filename);
+      if (existingAsset) {
+        return existingAsset;
+      }
+
+      await this.sleep(pollMs);
+    }
+
+    return null;
   }
 
   private getJobId(job: Job<PrepareDownloadJobData>): string {
@@ -326,5 +575,11 @@ export class DownloadPrepareProcessor extends WorkerHost {
     }
 
     return Math.floor(parsedValue);
+  }
+
+  private sleep(delayMs: number): Promise<void> {
+    return new Promise((resolve) => {
+      setTimeout(resolve, delayMs);
+    });
   }
 }

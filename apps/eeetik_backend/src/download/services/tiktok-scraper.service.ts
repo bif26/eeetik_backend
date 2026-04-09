@@ -49,6 +49,15 @@ export class TikTokScraperService {
       videoUrl: videoCdnCandidates.find(
         (candidate): candidate is string => typeof candidate === 'string',
       ),
+      videoHdUrl: this.firstString([
+        content.videoHD,
+        content.video?.playAddr?.[0],
+      ]),
+      videoSdUrl: this.firstString([
+        content.videoSD,
+        content.video?.downloadAddr?.[0],
+      ]),
+      videoWatermarkUrl: this.firstString([content.videoWatermark]),
       audioUrl: content.music?.playUrl?.[0],
       imageUrls,
       stats: this.extractStats(content.statistics),

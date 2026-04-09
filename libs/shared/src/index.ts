@@ -10,3 +10,6 @@ export * from './schemas/tiktok-metadata.schema';
 export * from './signing/signed-cdn-url';
 export * from './signing/signed-url-runtime-config';
 export * from './startup/dependency-readiness';
+export * from './security';
+export * from './storage';
+export * from './shared.module';

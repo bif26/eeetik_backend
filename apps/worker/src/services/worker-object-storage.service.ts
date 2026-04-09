@@ -1,63 +1,45 @@
-import {
-  DeleteObjectCommand,
-  GetObjectCommand,
-  PutObjectCommand,
-  S3Client,
-} from '@aws-sdk/client-s3';
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { UrlSigningService } from '@shared';
 import { PassThrough, Readable } from 'node:stream';
-
-const DEFAULT_SIGNED_URL_TTL_SECONDS = 600;
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
 
 @Injectable()
 export class WorkerObjectStorageService {
-  private readonly s3Client: S3Client;
-  private readonly bucketName: string;
+  private readonly storagePath: string;
 
-  constructor(private readonly configService: ConfigService) {
-    this.bucketName = this.configService.get<string>('S3_BUCKET', '');
-    const endpoint = this.configService.get<string>('S3_ENDPOINT');
-    const useSSL = this.configService.get<string>('S3_USE_SSL', 'false');
-    
-    this.s3Client = new S3Client({
-      endpoint: endpoint,
-      region: this.configService.get<string>('S3_REGION', 'us-east-1'),
-      credentials: {
-        accessKeyId: this.configService.get<string>('S3_ACCESS_KEY_ID', ''),
-        secretAccessKey: this.configService.get<string>(
-          'S3_SECRET_ACCESS_KEY',
-          '',
-        ),
-      },
-      forcePathStyle: true, // Required for MinIO
-      tls: useSSL.toLowerCase() === 'true',
-    });
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly urlSigningService: UrlSigningService,
+  ) {
+    this.storagePath = this.configService.get<string>(
+      'STORAGE_PATH',
+      './data/uploads',
+    );
   }
 
   async putBuffer(
-    key: string,
+    uniqueId: string,
+    filename: string,
     body: Buffer,
-    contentType: string,
   ): Promise<number> {
-    await this.s3Client.send(
-      new PutObjectCommand({
-        Bucket: this.bucketName,
-        Key: key,
-        Body: body,
-        ContentType: contentType,
-      }),
-    );
-
+    const filePath = this.getFilePath(uniqueId, filename);
+    const dir = path.dirname(filePath);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(filePath, body);
     return body.byteLength;
   }
 
   async putStream(
-    key: string,
+    uniqueId: string,
+    filename: string,
     body: Readable,
-    contentType: string,
   ): Promise<number> {
+    const filePath = this.getFilePath(uniqueId, filename);
+    const dir = path.dirname(filePath);
+    await fs.mkdir(dir, { recursive: true });
+
     let uploadedBytes = 0;
     const countingStream = new PassThrough();
     body.on('data', (chunk: Buffer | Uint8Array | string) => {
@@ -65,68 +47,130 @@ export class WorkerObjectStorageService {
     });
     body.pipe(countingStream);
 
-    await this.s3Client.send(
-      new PutObjectCommand({
-        Bucket: this.bucketName,
-        Key: key,
-        Body: countingStream,
-        ContentType: contentType,
-      }),
-    );
-
-    return uploadedBytes;
+    const writeStream = (await import('node:fs')).createWriteStream(filePath);
+    return new Promise((resolve, reject) => {
+      countingStream.pipe(writeStream);
+      writeStream.on('finish', () => resolve(uploadedBytes));
+      writeStream.on('error', reject);
+      countingStream.on('error', reject);
+    });
   }
 
-  async getBuffer(key: string): Promise<Buffer> {
-    const response = await this.s3Client.send(
-      new GetObjectCommand({
-        Bucket: this.bucketName,
-        Key: key,
-      }),
-    );
-
-    if (!response.Body) {
-      throw new Error(`Object not found in storage: ${key}`);
+  async getBuffer(uniqueId: string, filename: string): Promise<Buffer> {
+    const filePath = this.getFilePath(uniqueId, filename);
+    try {
+      return await fs.readFile(filePath);
+    } catch {
+      throw new Error(`Object not found in storage: ${uniqueId}/${filename}`);
     }
-
-    if ('transformToByteArray' in response.Body) {
-      const bytes = await response.Body.transformToByteArray();
-      return Buffer.from(bytes);
-    }
-
-    const chunks: Buffer[] = [];
-    for await (const chunk of response.Body as AsyncIterable<Uint8Array>) {
-      chunks.push(Buffer.from(chunk));
-    }
-
-    return Buffer.concat(chunks);
   }
 
-  async getSignedUrl(key: string, expiresInSeconds?: number): Promise<string> {
-    const signedUrlTtl =
-      expiresInSeconds ??
-      this.readPositiveIntegerConfig(
-        'SIGNED_URL_TTL_SECONDS',
-        DEFAULT_SIGNED_URL_TTL_SECONDS,
+  async fileExists(uniqueId: string, filename: string): Promise<boolean> {
+    const filePath = this.getFilePath(uniqueId, filename);
+    try {
+      await fs.access(filePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async getFileSize(uniqueId: string, filename: string): Promise<number> {
+    const filePath = this.getFilePath(uniqueId, filename);
+    const stats = await fs.stat(filePath);
+    return stats.size;
+  }
+
+  getSignedUrl(
+    uniqueIdOrStorageKey: string,
+    filename?: string,
+    expiresInSeconds?: number,
+  ): string {
+    if (filename) {
+      return this.urlSigningService.generateSignedUrl(
+        uniqueIdOrStorageKey,
+        filename,
+        expiresInSeconds,
       );
+    }
 
-    const command = new GetObjectCommand({
-      Bucket: this.bucketName,
-      Key: key,
-    });
-
-    return getSignedUrl(this.s3Client, command, {
-      expiresIn: signedUrlTtl,
-    });
+    const parsed = this.parseStorageKey(uniqueIdOrStorageKey);
+    return this.urlSigningService.generateSignedUrl(
+      parsed.uniqueId,
+      parsed.filename,
+      expiresInSeconds,
+    );
   }
 
-  async deleteObject(key: string): Promise<void> {
-    await this.s3Client.send(
-      new DeleteObjectCommand({
-        Bucket: this.bucketName,
-        Key: key,
-      }),
-    );
+  async deleteObject(storageKey: string): Promise<void> {
+    const { uniqueId, filename } = this.parseStorageKey(storageKey);
+    const filePath = this.getFilePath(uniqueId, filename);
+    try {
+      await fs.unlink(filePath);
+    } catch {
+      // Ignore error if file doesn't exist
+    }
+  }
+
+  toStorageKey(uniqueId: string, filename: string): string {
+    return `${uniqueId}/${filename}`;
+  }
+
+  parseStorageKey(storageKey: string): { uniqueId: string; filename: string } {
+    const normalized = storageKey
+      .trim()
+      .replace(/^\/+/, '')
+      .replace(/\/+$/, '');
+    const segments = normalized
+      .split('/')
+      .filter((segment) => segment.length > 0);
+
+    if (segments.length >= 2 && segments[0] === 'downloads') {
+      return {
+        uniqueId: segments[1],
+        filename: segments[segments.length - 1],
+      };
+    }
+
+    if (segments.length >= 2 && segments[0] === 'metadata') {
+      const uniqueId = segments[1];
+      if (segments[2] === 'images' && segments.length >= 4) {
+        return {
+          uniqueId,
+          filename: this.mapLegacyImageFilename(segments[3]),
+        };
+      }
+
+      return {
+        uniqueId,
+        filename: segments[segments.length - 1],
+      };
+    }
+
+    if (segments.length >= 2) {
+      return {
+        uniqueId: segments[segments.length - 2],
+        filename: segments[segments.length - 1],
+      };
+    }
+
+    throw new Error(`Invalid storage key: ${storageKey}`);
+  }
+
+  private getFilePath(uniqueId: string, filename: string): string {
+    return path.join(this.storagePath, uniqueId, filename);
+  }
+
+  private mapLegacyImageFilename(rawFilename: string): string {
+    const normalized = path.basename(rawFilename);
+    const ext = path.extname(normalized) || '.webp';
+    const stem = path.basename(normalized, ext);
+    const index = Number(stem);
+    if (!Number.isFinite(index)) {
+      return normalized;
+    }
+
+    return `image-${Math.max(0, Math.floor(index))}${ext}`;
   }
 
   private readChunkByteLength(chunk: Buffer | Uint8Array | string): number {
@@ -135,22 +179,5 @@ export class WorkerObjectStorageService {
     }
 
     return chunk.byteLength;
-  }
-
-  private readPositiveIntegerConfig(
-    envKey: string,
-    fallbackValue: number,
-  ): number {
-    const value = this.configService.get<string>(envKey);
-    if (value === undefined || value.trim().length === 0) {
-      return fallbackValue;
-    }
-
-    const parsedValue = Number(value);
-    if (!Number.isFinite(parsedValue) || parsedValue <= 0) {
-      return fallbackValue;
-    }
-
-    return Math.floor(parsedValue);
   }
 }

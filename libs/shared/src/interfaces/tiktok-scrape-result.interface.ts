@@ -11,6 +11,9 @@ export interface TikTokScrapeResult {
   authorAvatarUrl?: string;
   thumbnailUrl?: string;
   videoUrl?: string;
+  videoHdUrl?: string;
+  videoSdUrl?: string;
+  videoWatermarkUrl?: string;
   audioUrl?: string;
   imageUrls: string[];
   stats?: TikTokScrapeStats;

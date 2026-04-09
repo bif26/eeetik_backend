@@ -45,6 +45,18 @@ export class RedisCacheService implements OnModuleDestroy {
     return exists === 1;
   }
 
+  async incrementWithTtl(key: string, ttlMs: number): Promise<number> {
+    await this.connectIfNeeded();
+    const results = await this.redisClient
+      .multi()
+      .incr(key)
+      .pexpire(key, ttlMs)
+      .exec();
+
+    const incrementResult = results?.[0]?.[1];
+    return Number(incrementResult ?? 0);
+  }
+
   async acquireLock(
     key: string,
     ownerToken: string,

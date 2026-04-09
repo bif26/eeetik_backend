@@ -9,8 +9,10 @@ import {
   DownloadLogSchema,
   TikTokMetadata,
   TikTokMetadataSchema,
+  UrlSigningService,
 } from '@shared';
 import { DownloadPrepareProcessor } from './processors/download-prepare.processor';
+import { WorkerRedisCacheService } from './services/worker-redis-cache.service';
 import { StorageRetentionService } from './services/storage-retention.service';
 import { WorkerMediaService } from './services/worker-media.service';
 import { WorkerObjectStorageService } from './services/worker-object-storage.service';
@@ -59,6 +61,8 @@ import { WorkerObjectStorageService } from './services/worker-object-storage.ser
     DownloadPrepareProcessor,
     StorageRetentionService,
     WorkerMediaService,
+    WorkerRedisCacheService,
+    UrlSigningService,
     WorkerObjectStorageService,
   ],
 })

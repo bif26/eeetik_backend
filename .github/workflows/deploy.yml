@@ -1,0 +1,99 @@
+name: Deploy to DigitalOcean Droplet
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '22'
+  DEPLOY_PATH: /var/www/eeetik_backend
+
+jobs:
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build
+
+      - name: Create deployment archive
+        run: |
+          mkdir -p deploy
+          cp -r dist deploy/
+          cp -r node_modules deploy/
+          cp package.json package-lock.json ecosystem.config.js deploy/
+          cp .env.example deploy/.env
+          tar -czf deploy.tar.gz -C deploy .
+
+      - name: Copy files to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DROPLET_HOST }}
+          username: ${{ secrets.DROPLET_USERNAME }}
+          key: ${{ secrets.DROPLET_SSH_KEY }}
+          port: ${{ secrets.DROPLET_PORT || 22 }}
+          source: "deploy.tar.gz"
+          target: "/tmp/"
+
+      - name: Deploy and restart services
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DROPLET_HOST }}
+          username: ${{ secrets.DROPLET_USERNAME }}
+          key: ${{ secrets.DROPLET_SSH_KEY }}
+          port: ${{ secrets.DROPLET_PORT || 22 }}
+          script: |
+            # Create deployment directory if it doesn't exist
+            mkdir -p ${{ env.DEPLOY_PATH }}
+            
+            # Extract new deployment
+            cd ${{ env.DEPLOY_PATH }}
+            tar -xzf /tmp/deploy.tar.gz
+            rm /tmp/deploy.tar.gz
+            
+            # Load environment variables from .env if it exists
+            if [ -f .env ]; then
+              set -a
+              source .env
+              set +a
+            fi
+            
+            # Create logs directory
+            mkdir -p logs
+            
+            # Create storage directory
+            mkdir -p ${STORAGE_PATH:-./data/uploads}
+            
+            # Restart PM2 services
+            if pm2 list | grep -q "eeetik"; then
+              pm2 restart ecosystem.config.js
+            else
+              pm2 start ecosystem.config.js
+            fi
+            
+            # Save PM2 configuration
+            pm2 save
+            
+            # Show status
+            pm2 status
+
+      - name: Deployment health check
+        run: |
+          echo "Waiting for services to start..."
+          sleep 10
+          # Optional: Add health check curl command here if API_PUBLIC_BASE_URL is available

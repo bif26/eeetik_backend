@@ -11,6 +11,7 @@ import {
   REDIS_UNIQUE_PREFIX,
   TikTokMetadata,
 } from '@shared';
+import { createHash } from 'node:crypto';
 import { Queue } from 'bullmq';
 import { Model } from 'mongoose';
 import { mapAvailableFormats } from '../helpers/available-formats.mapper';
@@ -43,6 +44,10 @@ interface MetadataCacheRecordFixture {
   originalAudioUrl?: string;
   originalImageUrls?: string[];
   rawMetadata?: Record<string, unknown>;
+}
+
+function hashUrl(url: string): string {
+  return createHash('sha256').update(url.trim()).digest('hex');
 }
 
 function mockSourceUrlLookup(
@@ -97,6 +102,7 @@ function createService(configValues: Record<string, string> = {}) {
     new ConfigService({
       METADATA_CACHE_TTL_SECONDS: '86400',
       METADATA_SINGLEFLIGHT_WAIT_RETRY_MS: '0',
+      PREPARE_WAIT_TIMEOUT_MS: '0',
       ...configValues,
     }),
     {
@@ -165,7 +171,10 @@ describe('DownloadService preview response mapping', () => {
     };
     redisGet.mockResolvedValue(cacheRecord);
     objectStorageGetSignedUrl.mockImplementation(
-      (key: string) => `https://cdn.eeetik.app/${key}`,
+      (uniqueId: string, filename?: string) =>
+        filename
+          ? `https://cdn.eeetik.app/${uniqueId}/${filename}`
+          : `https://cdn.eeetik.app/${uniqueId}`,
     );
 
     const result = await service.fetchMetadata({ url: cacheRecord.sourceUrl });
@@ -179,7 +188,7 @@ describe('DownloadService preview response mapping', () => {
         title: 'Video caption',
         author: {
           nickname: 'creator_name',
-          avatar: 'https://cdn.eeetik.app/metadata/video-uuid/avatar.webp',
+          avatar: 'https://cdn.eeetik.app/video-uuid/avatar.webp',
         },
         stats: {
           views: '297.3K',
@@ -189,7 +198,7 @@ describe('DownloadService preview response mapping', () => {
         },
         hashtags: ['#fyp', '#travel'],
         availableFormats: mapAvailableFormats(PostType.VIDEO),
-        thumbnail: 'https://cdn.eeetik.app/metadata/video-uuid/thumbnail.webp',
+        thumbnail: 'https://cdn.eeetik.app/video-uuid/thumbnail.webp',
         duration: 17,
       },
     });
@@ -197,11 +206,13 @@ describe('DownloadService preview response mapping', () => {
     expect(objectStorageGetSignedUrl).toHaveBeenCalledTimes(2);
     expect(objectStorageGetSignedUrl).toHaveBeenNthCalledWith(
       1,
-      'metadata/video-uuid/avatar.webp',
+      'video-uuid',
+      'avatar.webp',
     );
     expect(objectStorageGetSignedUrl).toHaveBeenNthCalledWith(
       2,
-      'metadata/video-uuid/thumbnail.webp',
+      'video-uuid',
+      'thumbnail.webp',
     );
     expect(redisSet).toHaveBeenCalledWith(
       `${REDIS_UNIQUE_PREFIX}${cacheRecord.uniqueId}`,
@@ -226,7 +237,10 @@ describe('DownloadService preview response mapping', () => {
     };
     redisGet.mockResolvedValue(cacheRecord);
     objectStorageGetSignedUrl.mockImplementation(
-      (key: string) => `https://cdn.eeetik.app/${key}`,
+      (uniqueId: string, filename?: string) =>
+        filename
+          ? `https://cdn.eeetik.app/${uniqueId}/${filename}`
+          : `https://cdn.eeetik.app/${uniqueId}`,
     );
 
     const result = await service.fetchMetadata({ url: cacheRecord.sourceUrl });
@@ -250,19 +264,21 @@ describe('DownloadService preview response mapping', () => {
         hashtags: ['#summer', '#travel', '#already'],
         availableFormats: mapAvailableFormats(PostType.IMAGE),
         images: [
-          'https://cdn.eeetik.app/metadata/image-uuid/images/1.webp',
-          'https://cdn.eeetik.app/metadata/image-uuid/images/2.webp',
+          'https://cdn.eeetik.app/image-uuid/image-1.webp',
+          'https://cdn.eeetik.app/image-uuid/image-2.webp',
         ],
       },
     });
     expect(objectStorageGetSignedUrl).toHaveBeenCalledTimes(2);
     expect(objectStorageGetSignedUrl).toHaveBeenNthCalledWith(
       1,
-      'metadata/image-uuid/images/1.webp',
+      'image-uuid',
+      'image-1.webp',
     );
     expect(objectStorageGetSignedUrl).toHaveBeenNthCalledWith(
       2,
-      'metadata/image-uuid/images/2.webp',
+      'image-uuid',
+      'image-2.webp',
     );
     expect(redisSet).toHaveBeenCalledWith(
       `${REDIS_UNIQUE_PREFIX}${cacheRecord.uniqueId}`,
@@ -310,7 +326,10 @@ describe('DownloadService preview response mapping', () => {
     redisGet.mockResolvedValueOnce(null).mockResolvedValueOnce(null);
     mockSourceUrlLookup(tikTokMetadataFindOne, mongoMetadata);
     objectStorageGetSignedUrl.mockImplementation(
-      (key: string) => `https://cdn.eeetik.app/${key}`,
+      (uniqueId: string, filename?: string) =>
+        filename
+          ? `https://cdn.eeetik.app/${uniqueId}/${filename}`
+          : `https://cdn.eeetik.app/${uniqueId}`,
     );
 
     const result = await service.fetchMetadata({
@@ -320,16 +339,16 @@ describe('DownloadService preview response mapping', () => {
     expect(result.success).toBe(true);
     expect(scraperScrape).not.toHaveBeenCalled();
     expect(redisAcquireLock).toHaveBeenCalledWith(
-      `${REDIS_METADATA_LOCK_PREFIX}${encodeURIComponent(mongoMetadata.sourceUrl)}`,
+      `${REDIS_METADATA_LOCK_PREFIX}${hashUrl(mongoMetadata.sourceUrl)}`,
       expect.any(String),
       15000,
     );
     expect(redisReleaseLock).toHaveBeenCalledWith(
-      `${REDIS_METADATA_LOCK_PREFIX}${encodeURIComponent(mongoMetadata.sourceUrl)}`,
+      `${REDIS_METADATA_LOCK_PREFIX}${hashUrl(mongoMetadata.sourceUrl)}`,
       expect.any(String),
     );
     expect(redisSet).toHaveBeenCalledWith(
-      `${REDIS_METADATA_PREFIX}${encodeURIComponent(mongoMetadata.sourceUrl)}`,
+      `${REDIS_METADATA_PREFIX}${hashUrl(mongoMetadata.sourceUrl)}`,
       expect.objectContaining({
         uniqueId: mongoMetadata.uniqueId,
         originalVideoUrl: mongoMetadata.originalVideoUrl,
@@ -377,7 +396,10 @@ describe('DownloadService preview response mapping', () => {
     redisGet.mockResolvedValueOnce(null).mockResolvedValueOnce(cacheRecord);
     redisAcquireLock.mockResolvedValue(false);
     objectStorageGetSignedUrl.mockImplementation(
-      (key: string) => `https://cdn.eeetik.app/${key}`,
+      (uniqueId: string, filename?: string) =>
+        filename
+          ? `https://cdn.eeetik.app/${uniqueId}/${filename}`
+          : `https://cdn.eeetik.app/${uniqueId}`,
     );
 
     const result = await service.fetchMetadata({ url: cacheRecord.sourceUrl });

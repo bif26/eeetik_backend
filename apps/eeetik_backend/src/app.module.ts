@@ -10,6 +10,7 @@ import {
 } from '@nestjs/throttler';
 import { RedisThrottlerStorage } from './common/throttling/redis-throttler.storage';
 import { DownloadModule } from './download/download.module';
+import { FilesModule } from './files/files.module';
 import { HealthModule } from './health/health.module';
 import { ObservabilityModule } from './observability/observability.module';
 import { RequestMetricsInterceptor } from './observability/request-metrics.interceptor';
@@ -61,6 +62,7 @@ const EXPENSIVE_DOWNLOAD_HANDLERS = new Set([
     HealthModule,
     ObservabilityModule,
     DownloadModule,
+    FilesModule,
   ],
   providers: [
     {

@@ -9,9 +9,10 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { InjectModel } from '@nestjs/mongoose';
 import { Queue } from 'bullmq';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { Model } from 'mongoose';
 import {
+  DEFAULT_CDN_URL_CACHE_TTL_SECONDS,
   DEFAULT_METADATA_CACHE_TTL_SECONDS,
   DEFAULT_METADATA_SINGLEFLIGHT_LOCK_TTL_MS,
   DEFAULT_METADATA_SINGLEFLIGHT_MAX_RETRIES,
@@ -25,6 +26,7 @@ import {
   REDIS_METADATA_LOCK_PREFIX,
   PostType,
   PrepareDownloadJobData,
+  REDIS_CDN_PREFIX,
   REDIS_METADATA_PREFIX,
   REDIS_UNIQUE_PREFIX,
   TikTokMetadata,
@@ -65,12 +67,41 @@ interface MetadataCacheRecord {
   rawMetadata?: Record<string, unknown>;
 }
 
+interface CdnUrlCacheRecord {
+  uniqueId: string;
+  postType: PostType;
+  urls: {
+    hd?: string;
+    sd?: string;
+    audio?: string;
+    watermark?: string;
+  };
+  imageUrls: string[];
+  title?: string;
+  cachedAt: number;
+}
+
 const DEFAULT_STORAGE_MAX_MONTHLY_BYTES = 10 * 1024 * 1024 * 1024;
+const DEFAULT_PREPARE_WAIT_TIMEOUT_MS = 7_000;
+const DEFAULT_PREPARE_WAIT_POLL_INTERVAL_MS = 250;
+
+interface PrepareDownloadResponse {
+  jobId: string;
+  status: DownloadStatus;
+  downloadUrl?: string;
+  filename?: string;
+  filesize?: number;
+  expiresIn?: number;
+  errorMessage?: string;
+}
 
 @Injectable()
 export class DownloadService {
   private readonly metadataUrlCacheTtlSeconds: number;
   private readonly metadataUidCacheTtlSeconds: number;
+  private readonly cdnCacheTtlSeconds: number;
+  private readonly prepareWaitTimeoutMs: number;
+  private readonly prepareWaitPollIntervalMs: number;
   private readonly metadataSingleFlightLockTtlMs: number;
   private readonly metadataSingleFlightWaitRetryMs: number;
   private readonly metadataSingleFlightMaxRetries: number;
@@ -105,6 +136,21 @@ export class DownloadService {
       metadataCacheTtlSeconds,
       { min: 1 },
     );
+    this.cdnCacheTtlSeconds = this.getConfigAsInt(
+      'CDN_URL_CACHE_TTL_SECONDS',
+      DEFAULT_CDN_URL_CACHE_TTL_SECONDS,
+      { min: 1 },
+    );
+    this.prepareWaitTimeoutMs = this.getConfigAsInt(
+      'PREPARE_WAIT_TIMEOUT_MS',
+      DEFAULT_PREPARE_WAIT_TIMEOUT_MS,
+      { min: 0 },
+    );
+    this.prepareWaitPollIntervalMs = this.getConfigAsInt(
+      'PREPARE_WAIT_POLL_INTERVAL_MS',
+      DEFAULT_PREPARE_WAIT_POLL_INTERVAL_MS,
+      { min: 50 },
+    );
     this.metadataSingleFlightLockTtlMs = this.getConfigAsInt(
       'METADATA_SINGLEFLIGHT_LOCK_TTL_MS',
       DEFAULT_METADATA_SINGLEFLIGHT_LOCK_TTL_MS,
@@ -134,6 +180,7 @@ export class DownloadService {
 
     if (cachedMetadata) {
       await this.cacheMetadataByUniqueId(cachedMetadata);
+      await this.cacheCdnUrlsFromMetadata(cachedMetadata);
       this.logger.info('download.metadata.lookup', {
         requestId,
         route: '/model/download/tiktok',
@@ -144,7 +191,7 @@ export class DownloadService {
 
       return {
         success: true,
-        data: await this.toPublicMetadata(cachedMetadata),
+        data: this.toPublicMetadata(cachedMetadata),
       };
     }
 
@@ -163,6 +210,7 @@ export class DownloadService {
       );
       if (metadataFromWait) {
         await this.cacheMetadataByUniqueId(metadataFromWait);
+        await this.cacheCdnUrlsFromMetadata(metadataFromWait);
         this.logger.info('download.metadata.lookup', {
           requestId,
           route: '/model/download/tiktok',
@@ -173,7 +221,7 @@ export class DownloadService {
 
         return {
           success: true,
-          data: await this.toPublicMetadata(metadataFromWait),
+          data: this.toPublicMetadata(metadataFromWait),
         };
       }
 
@@ -199,6 +247,7 @@ export class DownloadService {
 
       if (cacheAfterLock) {
         await this.cacheMetadataByUniqueId(cacheAfterLock);
+        await this.cacheCdnUrlsFromMetadata(cacheAfterLock);
         this.logger.info('download.metadata.lookup', {
           requestId,
           route: '/model/download/tiktok',
@@ -209,7 +258,7 @@ export class DownloadService {
 
         return {
           success: true,
-          data: await this.toPublicMetadata(cacheAfterLock),
+          data: this.toPublicMetadata(cacheAfterLock),
         };
       }
 
@@ -222,6 +271,7 @@ export class DownloadService {
       if (mongoMetadata) {
         const cacheRecord = this.mapToCacheRecord(mongoMetadata);
         await this.cacheMetadata(payload.url, cacheRecord);
+        await this.cacheCdnUrlsFromMetadata(cacheRecord);
         this.logger.info('download.metadata.lookup', {
           requestId,
           route: '/model/download/tiktok',
@@ -232,7 +282,7 @@ export class DownloadService {
 
         return {
           success: true,
-          data: await this.toPublicMetadata(cacheRecord),
+          data: this.toPublicMetadata(cacheRecord),
         };
       }
 
@@ -243,6 +293,11 @@ export class DownloadService {
       );
       const cacheRecord = this.mapToCacheRecord(persisted);
       await this.cacheMetadata(payload.url, cacheRecord);
+      await this.cacheCdnUrlsFromScrapeResult(
+        cacheRecord.uniqueId,
+        cacheRecord.postType,
+        scrapeResult,
+      );
       this.logger.info('download.metadata.lookup', {
         requestId,
         route: '/model/download/tiktok',
@@ -253,7 +308,7 @@ export class DownloadService {
 
       return {
         success: true,
-        data: await this.toPublicMetadata(cacheRecord),
+        data: this.toPublicMetadata(cacheRecord),
       };
     } finally {
       if (hasLock) {
@@ -273,10 +328,7 @@ export class DownloadService {
   async prepareDownload(
     payload: PrepareDownloadDto,
     requestId?: string,
-  ): Promise<{
-    jobId: string;
-    status: DownloadStatus;
-  }> {
+  ): Promise<PrepareDownloadResponse> {
     this.adGateService.assertAccess(payload);
     await this.assertPrepareWithinMonthlyStorageCap(payload, requestId);
 
@@ -310,6 +362,43 @@ export class DownloadService {
       status: DownloadStatus.PROCESSING,
     });
     this.logger.info('download.prepare.enqueued', {
+      requestId,
+      route: '/model/download/tiktok/prepare',
+      uniqueId: payload.uniqueId,
+      jobId,
+      requestType: payload.requestType,
+      status: DownloadStatus.PROCESSING,
+    });
+
+    const preparedLog = await this.waitForPrepareResult(jobId);
+    if (preparedLog?.status === DownloadStatus.COMPLETED) {
+      this.logger.info('download.prepare.completed', {
+        requestId,
+        route: '/model/download/tiktok/prepare',
+        uniqueId: payload.uniqueId,
+        jobId,
+        requestType: payload.requestType,
+        status: DownloadStatus.COMPLETED,
+        storageKey: preparedLog.storageKey,
+        storageBytes: preparedLog.storageBytes,
+      });
+      return this.toPrepareDownloadResponse(preparedLog);
+    }
+
+    if (preparedLog?.status === DownloadStatus.FAILED) {
+      this.logger.warn('download.prepare.failed', {
+        requestId,
+        route: '/model/download/tiktok/prepare',
+        uniqueId: payload.uniqueId,
+        jobId,
+        requestType: payload.requestType,
+        status: DownloadStatus.FAILED,
+        errorMessage: preparedLog.errorMessage,
+      });
+      return this.toPrepareDownloadResponse(preparedLog);
+    }
+
+    this.logger.info('download.prepare.processing', {
       requestId,
       route: '/model/download/tiktok/prepare',
       uniqueId: payload.uniqueId,
@@ -357,6 +446,81 @@ export class DownloadService {
     };
   }
 
+  private async waitForPrepareResult(
+    jobId: string,
+  ): Promise<Pick<
+    DownloadLog,
+    | 'jobId'
+    | 'status'
+    | 'downloadUrl'
+    | 'storageKey'
+    | 'storageBytes'
+    | 'storageExpiresAt'
+    | 'errorMessage'
+  > | null> {
+    if (this.prepareWaitTimeoutMs <= 0) {
+      return null;
+    }
+
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < this.prepareWaitTimeoutMs) {
+      const downloadLog = await this.downloadLogModel
+        .findOne({ jobId })
+        .lean()
+        .exec();
+      if (!downloadLog) {
+        await this.sleep(this.prepareWaitPollIntervalMs);
+        continue;
+      }
+
+      if (
+        downloadLog.status === DownloadStatus.COMPLETED ||
+        downloadLog.status === DownloadStatus.FAILED
+      ) {
+        return downloadLog;
+      }
+
+      await this.sleep(this.prepareWaitPollIntervalMs);
+    }
+
+    return null;
+  }
+
+  private toPrepareDownloadResponse(
+    downloadLog: Pick<
+      DownloadLog,
+      | 'jobId'
+      | 'status'
+      | 'downloadUrl'
+      | 'storageKey'
+      | 'storageBytes'
+      | 'storageExpiresAt'
+      | 'errorMessage'
+    >,
+  ): PrepareDownloadResponse {
+    const filename = downloadLog.storageKey
+      ? downloadLog.storageKey.split('/').pop()
+      : undefined;
+    const expiresInSeconds = downloadLog.storageExpiresAt
+      ? Math.max(
+          0,
+          Math.floor(
+            (downloadLog.storageExpiresAt.getTime() - Date.now()) / 1000,
+          ),
+        )
+      : undefined;
+
+    return {
+      jobId: downloadLog.jobId,
+      status: downloadLog.status,
+      downloadUrl: downloadLog.downloadUrl,
+      filename,
+      filesize: downloadLog.storageBytes,
+      expiresIn: expiresInSeconds,
+      errorMessage: downloadLog.errorMessage,
+    };
+  }
+
   private async persistScrapeResult(
     sourceUrl: string,
     scrapeResult: TikTokScrapeResult,
@@ -397,7 +561,10 @@ export class DownloadService {
       duration: scrapeResult.duration,
       thumbnailKey,
       imageKeys,
-      originalVideoUrl: scrapeResult.videoUrl,
+      originalVideoUrl:
+        scrapeResult.videoHdUrl ??
+        scrapeResult.videoSdUrl ??
+        scrapeResult.videoUrl,
       originalAudioUrl: scrapeResult.audioUrl,
       originalImageUrls: scrapeResult.imageUrls,
       rawMetadata: scrapeResult.raw,
@@ -415,13 +582,12 @@ export class DownloadService {
         thumbnailUrl,
         1080,
       );
-    const thumbnailKey = `metadata/${uniqueId}/thumbnail.webp`;
     await this.objectStorageService.putBuffer(
-      thumbnailKey,
+      uniqueId,
+      'thumbnail.webp',
       thumbnailBuffer,
-      'image/webp',
     );
-    return thumbnailKey;
+    return 'thumbnail.webp';
   }
 
   private async persistImages(
@@ -435,13 +601,13 @@ export class DownloadService {
             imageUrl,
             1440,
           );
-        const imageKey = `metadata/${uniqueId}/images/${index + 1}.webp`;
+        const imageFilename = `image-${index}.webp`;
         await this.objectStorageService.putBuffer(
-          imageKey,
+          uniqueId,
+          imageFilename,
           imageBuffer,
-          'image/webp',
         );
-        return imageKey;
+        return imageFilename;
       }),
     );
   }
@@ -455,13 +621,12 @@ export class DownloadService {
         authorAvatarUrl,
         512,
       );
-    const authorAvatarKey = `metadata/${uniqueId}/avatar.webp`;
     await this.objectStorageService.putBuffer(
-      authorAvatarKey,
+      uniqueId,
+      'avatar.webp',
       avatarBuffer,
-      'image/webp',
     );
-    return authorAvatarKey;
+    return 'avatar.webp';
   }
 
   private mapToCacheRecord(metadata: TikTokMetadata): MetadataCacheRecord {
@@ -472,12 +637,20 @@ export class DownloadService {
       title: metadata.title,
       authorName: metadata.authorName,
       authorAvatarUrl: metadata.authorAvatarUrl,
-      authorAvatarKey: metadata.authorAvatarKey,
+      authorAvatarKey: this.normalizeStoredFilename(
+        metadata.uniqueId,
+        metadata.authorAvatarKey,
+      ),
       stats: metadata.stats,
       hashtags: metadata.hashtags ?? [],
       duration: metadata.duration,
-      thumbnailKey: metadata.thumbnailKey,
-      imageKeys: metadata.imageKeys ?? [],
+      thumbnailKey: this.normalizeStoredFilename(
+        metadata.uniqueId,
+        metadata.thumbnailKey,
+      ),
+      imageKeys: (metadata.imageKeys ?? [])
+        .map((key) => this.normalizeStoredFilename(metadata.uniqueId, key))
+        .filter((key): key is string => typeof key === 'string'),
       originalVideoUrl: metadata.originalVideoUrl,
       originalAudioUrl: metadata.originalAudioUrl,
       originalImageUrls: metadata.originalImageUrls ?? [],
@@ -485,21 +658,27 @@ export class DownloadService {
     };
   }
 
-  private async toPublicMetadata(
-    record: MetadataCacheRecord,
-  ): Promise<TikTokPreviewData> {
-    const authorAvatar = record.authorAvatarKey
-      ? await this.objectStorageService.getSignedUrl(record.authorAvatarKey)
+  private toPublicMetadata(record: MetadataCacheRecord): TikTokPreviewData {
+    const authorAvatarFilename = this.normalizeStoredFilename(
+      record.uniqueId,
+      record.authorAvatarKey,
+    );
+    const authorAvatar = authorAvatarFilename
+      ? this.objectStorageService.getSignedUrl(
+          record.uniqueId,
+          authorAvatarFilename,
+        )
       : null;
     const stats = this.formatStats(record.stats);
     const hashtags = this.normalizeHashtags(record.hashtags ?? []);
 
     if (record.postType === PostType.IMAGE) {
-      const images = await Promise.all(
-        (record.imageKeys ?? []).map((key) =>
-          this.objectStorageService.getSignedUrl(key),
-        ),
-      );
+      const images = (record.imageKeys ?? [])
+        .map((key) => this.normalizeStoredFilename(record.uniqueId, key))
+        .filter((filename): filename is string => typeof filename === 'string')
+        .map((filename) =>
+          this.objectStorageService.getSignedUrl(record.uniqueId, filename),
+        );
 
       return {
         uniqueId: record.uniqueId,
@@ -516,8 +695,15 @@ export class DownloadService {
       };
     }
 
-    const thumbnail = record.thumbnailKey
-      ? await this.objectStorageService.getSignedUrl(record.thumbnailKey)
+    const thumbnailFilename = this.normalizeStoredFilename(
+      record.uniqueId,
+      record.thumbnailKey,
+    );
+    const thumbnail = thumbnailFilename
+      ? this.objectStorageService.getSignedUrl(
+          record.uniqueId,
+          thumbnailFilename,
+        )
       : null;
 
     return {
@@ -581,6 +767,69 @@ export class DownloadService {
       );
     } catch (error) {
       this.logger.warn('download.metadata.cache_uid_failed', {
+        uniqueId: record.uniqueId,
+        error: this.toErrorMessage(error),
+      });
+    }
+  }
+
+  private async cacheCdnUrlsFromScrapeResult(
+    uniqueId: string,
+    postType: PostType,
+    scrapeResult: TikTokScrapeResult,
+  ): Promise<void> {
+    const record: CdnUrlCacheRecord = {
+      uniqueId,
+      postType,
+      urls: {
+        hd: scrapeResult.videoHdUrl ?? scrapeResult.videoUrl,
+        sd: scrapeResult.videoSdUrl ?? scrapeResult.videoUrl,
+        audio: scrapeResult.audioUrl,
+        watermark: scrapeResult.videoWatermarkUrl,
+      },
+      imageUrls: scrapeResult.imageUrls,
+      title: scrapeResult.title,
+      cachedAt: Date.now(),
+    };
+    await this.cacheCdnUrls(record);
+  }
+
+  private async cacheCdnUrlsFromMetadata(
+    record: MetadataCacheRecord,
+  ): Promise<void> {
+    const cdnRecord: CdnUrlCacheRecord = {
+      uniqueId: record.uniqueId,
+      postType: record.postType,
+      urls: {
+        hd: record.originalVideoUrl,
+        sd: record.originalVideoUrl,
+        audio: record.originalAudioUrl,
+      },
+      imageUrls: record.originalImageUrls ?? [],
+      title: record.title,
+      cachedAt: Date.now(),
+    };
+    await this.cacheCdnUrls(cdnRecord);
+  }
+
+  private async cacheCdnUrls(record: CdnUrlCacheRecord): Promise<void> {
+    if (
+      !record.urls.hd &&
+      !record.urls.sd &&
+      !record.urls.audio &&
+      record.imageUrls.length === 0
+    ) {
+      return;
+    }
+
+    try {
+      await this.redisCacheService.set(
+        this.getCdnCacheKey(record.uniqueId),
+        record,
+        this.cdnCacheTtlSeconds,
+      );
+    } catch (error) {
+      this.logger.warn('download.cdn.cache_failed', {
         uniqueId: record.uniqueId,
         error: this.toErrorMessage(error),
       });
@@ -694,15 +943,82 @@ export class DownloadService {
   }
 
   private getMetadataCacheKeyByUrl(url: string): string {
-    return `${REDIS_METADATA_PREFIX}${encodeURIComponent(url)}`;
+    return `${REDIS_METADATA_PREFIX}${this.hashUrl(url)}`;
   }
 
   private getMetadataCacheKeyByUniqueId(uniqueId: string): string {
     return `${REDIS_UNIQUE_PREFIX}${uniqueId}`;
   }
 
+  private getCdnCacheKey(uniqueId: string): string {
+    return `${REDIS_CDN_PREFIX}${uniqueId}`;
+  }
+
   private getMetadataLockKey(url: string): string {
-    return `${REDIS_METADATA_LOCK_PREFIX}${encodeURIComponent(url)}`;
+    return `${REDIS_METADATA_LOCK_PREFIX}${this.hashUrl(url)}`;
+  }
+
+  private hashUrl(url: string): string {
+    return createHash('sha256').update(url.trim()).digest('hex');
+  }
+
+  private normalizeStoredFilename(
+    uniqueId: string,
+    keyOrFilename?: string,
+  ): string | undefined {
+    if (!keyOrFilename) {
+      return undefined;
+    }
+
+    const trimmed = keyOrFilename.trim().replace(/^\/+/, '');
+    if (!trimmed) {
+      return undefined;
+    }
+
+    if (!trimmed.includes('/')) {
+      return trimmed;
+    }
+
+    const segments = trimmed.split('/').filter((segment) => segment.length > 0);
+    if (segments.length === 0) {
+      return undefined;
+    }
+
+    if (
+      segments[0] === 'metadata' &&
+      segments.length >= 3 &&
+      segments[1] === uniqueId
+    ) {
+      if (segments[2] === 'images' && segments.length >= 4) {
+        const rawFilename = segments[3];
+        const ext = rawFilename.includes('.')
+          ? rawFilename.slice(rawFilename.lastIndexOf('.'))
+          : '.webp';
+        const stem = rawFilename.replace(/\.[^.]*$/, '');
+        const index = Number(stem);
+        if (Number.isFinite(index)) {
+          return `image-${Math.max(0, Math.floor(index))}${ext}`;
+        }
+
+        return rawFilename;
+      }
+
+      return segments[segments.length - 1];
+    }
+
+    if (
+      segments[0] === 'downloads' &&
+      segments.length >= 3 &&
+      segments[1] === uniqueId
+    ) {
+      return segments[segments.length - 1];
+    }
+
+    if (segments[0] === uniqueId && segments.length >= 2) {
+      return segments[segments.length - 1];
+    }
+
+    return segments[segments.length - 1];
   }
 
   private toErrorMessage(error: unknown): string {

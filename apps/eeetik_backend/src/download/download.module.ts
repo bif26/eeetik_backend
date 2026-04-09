@@ -8,6 +8,7 @@ import {
   DownloadLogSchema,
   TikTokMetadata,
   TikTokMetadataSchema,
+  SharedModule,
 } from '@shared';
 import { SiteDomainGuard } from '../common/guards/site-domain.guard';
 import { DownloadController } from './download.controller';
@@ -21,6 +22,7 @@ import { TikTokScraperService } from './services/tiktok-scraper.service';
 @Module({
   imports: [
     HttpModule,
+    SharedModule,
     BullModule.registerQueue({
       name: DOWNLOAD_QUEUE_NAME,
     }),

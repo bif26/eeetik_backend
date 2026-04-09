@@ -6,6 +6,7 @@ import {
   waitForCriticalDependencies,
 } from '@shared';
 import { config as loadEnv } from 'dotenv';
+import { json, urlencoded } from 'express';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
 
@@ -20,8 +21,26 @@ async function bootstrap(): Promise<void> {
 
   const app = await NestFactory.create(AppModule);
   const configService = app.get(ConfigService);
+  const requestBodyLimit = configService.get<string>(
+    'REQUEST_BODY_LIMIT',
+    '1mb',
+  );
 
-  app.use(helmet());
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        useDefaults: true,
+        directives: {
+          defaultSrc: ["'self'"],
+          baseUri: ["'self'"],
+          objectSrc: ["'none'"],
+          frameAncestors: ["'none'"],
+        },
+      },
+    }),
+  );
+  app.use(json({ limit: requestBodyLimit }));
+  app.use(urlencoded({ extended: true, limit: requestBodyLimit }));
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
