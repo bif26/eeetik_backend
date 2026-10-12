@@ -90,6 +90,13 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    if (!this.shouldRunBotOnThisDyno()) {
+      this.consoleLogger.log(
+        `Heroku dyno ${String(process.env.DYNO)} – Telegram bot runs on the web dyno only.`,
+      );
+      return;
+    }
+
     this.bot = new Bot(token);
     this.bot.catch((botError) => {
       const error = botError?.error;
@@ -511,6 +518,21 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       .get<string>('TELEGRAM_MINI_APP_URL')
       ?.trim();
     return miniAppUrl || undefined;
+  }
+
+  /**
+   * Heroku exposes shared config vars to every dyno of the app. The bot must
+   * only run on the `web` dyno, otherwise a `worker` dyno would join the same
+   * polling loop / overwrite the webhook (Telegram answers 409 conflicts).
+   * Outside Heroku (Render, local dev) there is no DYNO variable and the
+   * ENABLE_TELEGRAM_BOT flag alone stays in control.
+   */
+  private shouldRunBotOnThisDyno(): boolean {
+    const dyno = process.env.DYNO?.trim();
+    if (!dyno) {
+      return true;
+    }
+    return dyno.startsWith('web');
   }
 
   private readBooleanFlag(key: string, fallbackValue: boolean): boolean {

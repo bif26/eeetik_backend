@@ -4,10 +4,12 @@ import { ConfigService } from '@nestjs/config';
  * Core ioredis connection options shared by every Redis consumer in the
  * codebase (BullMQ, cache services, throttler storage, readiness probes).
  *
- * Prefers Upstash (free-tier managed Redis) over the legacy self-hosted
- * REDIS_* variables:
- * - UPSTASH_REDIS_HOST / UPSTASH_REDIS_PASSWORD / UPSTASH_REDIS_PORT / UPSTASH_REDIS_TLS
- * - falls back to REDIS_HOST / REDIS_PASSWORD / REDIS_PORT for local dev
+ * Resolution order:
+ * 1. REDIS_URL – full connection string (`redis://` / `rediss://`). This is
+ *    what Heroku Redis, Redis Cloud, Railway, Render Key Value and most
+ *    providers expose as a single variable.
+ * 2. UPSTASH_REDIS_HOST / UPSTASH_REDIS_PASSWORD / UPSTASH_REDIS_PORT / UPSTASH_REDIS_TLS
+ * 3. REDIS_HOST / REDIS_PASSWORD / REDIS_PORT for local dev
  */
 export interface RedisCoreConnectionOptions {
   host: string;
@@ -58,9 +60,68 @@ function isTruthyFlag(value: string | undefined): boolean {
   return !FALSY_FLAGS.has(value.toLowerCase());
 }
 
+/**
+ * Parses a `redis://` / `rediss://` connection URL (Heroku Redis, Redis
+ * Cloud, Render Key Value, …) into core connection options.
+ *
+ * - `rediss://` enables TLS (`rejectUnauthorized: false`, matching the
+ *   Upstash handling)
+ * - passwords may live in the URL password slot (`redis://:pw@host`) or the
+ *   username slot (`redis://default:pw@host` style providers are handled)
+ * - returns null when the URL is malformed or has a foreign scheme
+ */
+export function parseRedisUrl(
+  rawUrl: string,
+): RedisCoreConnectionOptions | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl.trim());
+  } catch {
+    return null;
+  }
+
+  if (parsed.protocol !== 'redis:' && parsed.protocol !== 'rediss:') {
+    return null;
+  }
+
+  const decode = (value: string): string => {
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return value;
+    }
+  };
+
+  const options: RedisCoreConnectionOptions = {
+    host: parsed.hostname,
+    port: Number(parsed.port) || DEFAULT_REDIS_PORT,
+    tls:
+      parsed.protocol === 'rediss:' ? { rejectUnauthorized: false } : undefined,
+  };
+
+  const password = parsed.password
+    ? decode(parsed.password)
+    : parsed.username && parsed.username !== 'default'
+      ? decode(parsed.username)
+      : undefined;
+  if (password) {
+    options.password = password;
+  }
+
+  return options;
+}
+
 export function readRedisCoreOptions(
   configService?: ConfigService,
 ): RedisCoreConnectionOptions {
+  const redisUrl = readEnvValue(configService, 'REDIS_URL');
+  if (redisUrl) {
+    const parsed = parseRedisUrl(redisUrl);
+    if (parsed) {
+      return parsed;
+    }
+  }
+
   const upstashHost = readEnvValue(configService, 'UPSTASH_REDIS_HOST');
   const host =
     upstashHost ??

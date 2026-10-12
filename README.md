@@ -143,6 +143,69 @@ Two layers of automation are wired up:
 
 ---
 
+## Deployment on Heroku (free credits)
+
+Heroku is a good alternative when you have credits and want dynos that
+**never sleep** (Render free web services sleep after 15 idle minutes).
+
+| Resource | Purpose | Cost |
+|---|---|---|
+| `web` dyno (Basic) | API + Telegram bot **+ BullMQ worker** (single-dyno mode) | ~$7/mo |
+| `worker` dyno (optional) | dedicated queue processing dyno | ~$7/mo |
+| `heroku-redis` (mini addon) | BullMQ + caches (`REDIS_URL` injected automatically) | ~$3/mo |
+| MongoDB Atlas M0 | database — free, no credit card | $0 |
+| Render static site | Mini App hosting — free, no credit card | $0 |
+
+> Redis is covered by your credits via the `heroku-redis` mini addon, so no
+> Upstash account (and no credit card) is needed. Cardless free Redis
+> alternatives (Redis Cloud 30 MB) also work: just set `REDIS_URL` manually.
+
+### Steps
+
+1. **Create the app + Redis** (CLI or dashboard):
+   ```bash
+   heroku create eeetik-app
+   heroku addons:create heroku-redis:mini
+   # BullMQ requires noeviction – never use allkeys-lru with queues:
+   heroku redis:maxmemory $(heroku config:get HEROKU_REDIS_URL -s | sed 's/.*\/\([^/]*\)$/\1/' ) --policy noeviction 2>/dev/null || heroku redis:maxmemory REDIS --policy noeviction
+   ```
+   Simpler via dashboard: Resources → *Heroku Key-Value Store* (mini) →
+   Settings → *maxmemory policy* → `noeviction`.
+2. **Set config vars** (Settings → Reveal Config Vars, or `heroku config:set`):
+   ```bash
+   heroku config:set \
+     MONGO_URI="mongodb+srv://user:pass@cluster0.xxx.mongodb.net/eeetik?retryWrites=true&w=majority" \
+     TELEGRAM_BOT_TOKEN="123456:AA-your-botfather-token" \
+     TELEGRAM_MINI_APP_URL="https://your-miniapp.onrender.com" \
+     TELEGRAM_WEBHOOK_SECRET="<openssl rand -hex 32>" \
+     BOT_INTERNAL_SECRET="<openssl rand -hex 32>" \
+     JWT_SECRET="<openssl rand -hex 32>" \
+     TELEGRAM_WEBHOOK_URL="https://eeetik-app-xxxx.herokuapp.com/api/v2/bot/webhook" \
+     CORS_ORIGINS="https://your-miniapp.onrender.com"
+   ```
+   `REDIS_URL` is created by the addon automatically and `rediss://` TLS is
+   detected out of the box.
+3. **Deploy**: `git push heroku main` — the `heroku-postbuild` script builds
+   the shared lib, API and worker.
+4. **Dyno sizing**:
+   - *Single dyno (default, ~$10/mo with Redis):* `heroku ps:scale web=1 worker=0`
+     — the `web` dyno runs the API, the bot **and** the worker together
+     (see `scripts/start-combined.js`).
+   - *Separate worker (~$17/mo with Redis):*
+     `heroku config:set ENABLE_COMBINED_WORKER=false && heroku ps:scale web=1 worker=1`
+   The bot only starts on the `web` dyno (detected via `DYNO`), so there are
+   never Telegram polling/webhook conflicts between dynos.
+5. **Mini App hosting** stays on Render (static sites are free, no card):
+   *New → Static Site* → repo → build `cd apps/miniapp && npm ci && npm run build`
+   → publish `apps/miniapp/build` → env `PUBLIC_API_BASE_URL=https://eeetik-app-xxxx.herokuapp.com`
+   → rewrite rule `/* → /index.html`. Then match `TELEGRAM_MINI_APP_URL` /
+   `CORS_ORIGINS` on Heroku to the static site URL.
+
+> With ~$200 in credits at $8–17/month, expect **12–25 months** of uptime for
+> a single-user setup.
+
+---
+
 ## Mini App development
 
 ```bash
