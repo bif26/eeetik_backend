@@ -1,0 +1,45 @@
+name: Deploy to Render
+
+# Automatic deployment pipeline:
+#   1. Render Blueprint (render.yaml) with autoDeploy: true deploys every push
+#      to main once the services are created from the blueprint (one-click).
+#   2. This workflow additionally pings the Render Deploy Hooks so all three
+#      services redeploy in sync. Deploy hooks are optional: configure the
+#      repository secrets below (found in Render → Service → Settings →
+#      Deploy Hook). Missing hooks are skipped gracefully.
+#
+# Secrets (all optional):
+#   RENDER_DEPLOY_HOOK_API     – deploy hook URL of the eeetik-api service
+#   RENDER_DEPLOY_HOOK_WORKER  – deploy hook URL of the eeetik-worker service
+#   RENDER_DEPLOY_HOOK_MINIAPP – deploy hook URL of the eeetik-miniapp site
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Trigger Render deploy hooks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploys
+        env:
+          API_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_API }}
+          WORKER_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_WORKER }}
+          MINIAPP_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_MINIAPP }}
+        run: |
+          trigger() {
+            name="$1"; url="$2"
+            if [ -z "$url" ]; then
+              echo "::notice::$name: no deploy hook configured (skipped — Render autoDeploy handles it)"
+              return 0
+            fi
+            echo "Triggering $name deploy..."
+            curl -fsS --max-time 30 -X POST "$url"
+            echo "$name deploy triggered"
+          }
+          trigger "eeetik-api"     "$API_HOOK"
+          trigger "eeetik-worker"  "$WORKER_HOOK"
+          trigger "eeetik-miniapp" "$MINIAPP_HOOK"
