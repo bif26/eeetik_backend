@@ -6,3 +6,6 @@ coverage
 .local/
 .DS_Store
 npm-debug.log*
+apps/miniapp/.svelte-kit
+apps/miniapp/build
+apps/miniapp/node_modules

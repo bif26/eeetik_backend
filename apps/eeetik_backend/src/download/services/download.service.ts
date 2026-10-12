@@ -84,6 +84,8 @@ interface CdnUrlCacheRecord {
 const DEFAULT_STORAGE_MAX_MONTHLY_BYTES = 10 * 1024 * 1024 * 1024;
 const DEFAULT_PREPARE_WAIT_TIMEOUT_MS = 7_000;
 const DEFAULT_PREPARE_WAIT_POLL_INTERVAL_MS = 250;
+const DEFAULT_HISTORY_LIMIT = 20;
+type StorageBackend = 'telegram' | 'local';
 
 interface PrepareDownloadResponse {
   jobId: string;
@@ -105,6 +107,7 @@ export class DownloadService {
   private readonly metadataSingleFlightLockTtlMs: number;
   private readonly metadataSingleFlightWaitRetryMs: number;
   private readonly metadataSingleFlightMaxRetries: number;
+  private readonly storageBackend: StorageBackend;
   private readonly logger = getStructuredLogger('api');
 
   constructor(
@@ -166,6 +169,10 @@ export class DownloadService {
       DEFAULT_METADATA_SINGLEFLIGHT_MAX_RETRIES,
       { min: 1 },
     );
+    this.storageBackend =
+      configService.get<string>('STORAGE_BACKEND', 'telegram') === 'local'
+        ? 'local'
+        : 'telegram';
   }
 
   async fetchMetadata(
@@ -328,9 +335,15 @@ export class DownloadService {
   async prepareDownload(
     payload: PrepareDownloadDto,
     requestId?: string,
+    options?: { skipAdGate?: boolean },
   ): Promise<PrepareDownloadResponse> {
-    this.adGateService.assertAccess(payload);
-    await this.assertPrepareWithinMonthlyStorageCap(payload, requestId);
+    if (options?.skipAdGate !== true) {
+      this.adGateService.assertAccess(payload);
+    }
+
+    if (this.storageBackend === 'local') {
+      await this.assertPrepareWithinMonthlyStorageCap(payload, requestId);
+    }
 
     const metadata = await this.tikTokMetadataModel
       .findOne({ uniqueId: payload.uniqueId })
@@ -350,8 +363,9 @@ export class DownloadService {
       },
       {
         jobId,
-        removeOnComplete: 500,
-        removeOnFail: 1000,
+        removeOnComplete: true,
+        removeOnFail: 100,
+        attempts: 2,
       },
     );
 
@@ -444,6 +458,115 @@ export class DownloadService {
       downloadUrl: downloadLog.downloadUrl,
       errorMessage: downloadLog.errorMessage,
     };
+  }
+
+  /**
+   * Bot/Mini App flow: enqueue a download job that will be delivered
+   * directly to the requesting Telegram chat by the worker.
+   * No synchronous wait — the worker sends the media and updates the log.
+   */
+  async enqueueBotDownload(payload: {
+    uniqueId: string;
+    requestType: DownloadRequestType;
+    chatId: number;
+    telegramUserId?: number;
+    requestId?: string;
+  }): Promise<{ jobId: string; status: DownloadStatus }> {
+    const metadata = await this.tikTokMetadataModel
+      .findOne({ uniqueId: payload.uniqueId })
+      .lean()
+      .exec();
+
+    if (!metadata) {
+      throw new NotFoundException('Metadata uniqueId was not found');
+    }
+
+    const jobId = randomUUID();
+    await this.downloadQueue.add(
+      DOWNLOAD_PREPARE_JOB_NAME,
+      {
+        uniqueId: payload.uniqueId,
+        requestType: payload.requestType,
+        chatId: payload.chatId,
+        telegramUserId: payload.telegramUserId,
+      },
+      {
+        jobId,
+        removeOnComplete: true,
+        removeOnFail: 100,
+        attempts: 2,
+      },
+    );
+
+    await this.downloadLogModel.create({
+      jobId,
+      uniqueId: payload.uniqueId,
+      requestType: payload.requestType,
+      status: DownloadStatus.PROCESSING,
+      chatId: payload.chatId,
+      telegramUserId: payload.telegramUserId,
+    });
+
+    this.logger.info('download.prepare.bot_enqueued', {
+      requestId: payload.requestId,
+      route: 'bot/enqueue',
+      uniqueId: payload.uniqueId,
+      jobId,
+      requestType: payload.requestType,
+      chatId: payload.chatId,
+      telegramUserId: payload.telegramUserId,
+      status: DownloadStatus.PROCESSING,
+    });
+
+    return { jobId, status: DownloadStatus.PROCESSING };
+  }
+
+  async getDownloadHistory(
+    auth: { type: string; telegramUserId?: number },
+    limit = DEFAULT_HISTORY_LIMIT,
+    requestId?: string,
+  ): Promise<
+    Array<{
+      jobId: string;
+      uniqueId: string;
+      requestType: DownloadRequestType;
+      status: DownloadStatus;
+      createdAt?: Date;
+    }>
+  > {
+    const filter =
+      typeof auth.telegramUserId === 'number'
+        ? { telegramUserId: auth.telegramUserId }
+        : {};
+
+    const logs = await this.downloadLogModel
+      .find(filter)
+      .sort({ createdAt: -1 })
+      .limit(Math.max(1, Math.min(Math.floor(limit), 100)))
+      .select({
+        jobId: 1,
+        uniqueId: 1,
+        requestType: 1,
+        status: 1,
+        createdAt: 1,
+      })
+      .lean()
+      .exec();
+
+    this.logger.info('download.history.lookup', {
+      requestId,
+      route: '/model/download/tiktok/history',
+      telegramUserId: auth.telegramUserId,
+      count: logs.length,
+    });
+
+    return logs.map((log) => ({
+      jobId: log.jobId,
+      uniqueId: log.uniqueId,
+      requestType: log.requestType,
+      status: log.status,
+      createdAt: log.createdAt,
+    }));
   }
 
   private async waitForPrepareResult(
@@ -560,6 +683,8 @@ export class DownloadService {
       hashtags: scrapeResult.hashtags,
       duration: scrapeResult.duration,
       thumbnailKey,
+      thumbnailUrl:
+        postType === PostType.VIDEO ? scrapeResult.thumbnailUrl : undefined,
       imageKeys,
       originalVideoUrl:
         scrapeResult.videoHdUrl ??

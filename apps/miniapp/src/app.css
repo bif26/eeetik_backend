@@ -1,0 +1,48 @@
+@import 'tailwindcss';
+
+@plugin 'daisyui' {
+	themes:
+		light --default,
+		dark --prefersdark,
+		telegram;
+}
+
+/* Telegram-flavoured daisyUI theme (Telegram blue #3390ec). */
+@plugin 'daisyui/theme' {
+	name: 'telegram';
+	default: false;
+	prefersdark: false;
+	color-scheme: light;
+
+	--color-base-100: oklch(100% 0 0);
+	--color-base-200: oklch(96.8% 0.002 247.9);
+	--color-base-300: oklch(92.5% 0.004 247.9);
+	--color-base-content: oklch(21% 0.02 247.9);
+
+	--color-primary: oklch(62% 0.19 257.5);
+	--color-primary-content: oklch(100% 0 0);
+	--color-secondary: oklch(70% 0.15 244.5);
+	--color-secondary-content: oklch(100% 0 0);
+	--color-accent: oklch(65% 0.17 149.5);
+	--color-accent-content: oklch(100% 0 0);
+	--color-neutral: oklch(25% 0.02 247.9);
+	--color-neutral-content: oklch(100% 0 0);
+
+	--color-info: oklch(62% 0.19 257.5);
+	--color-info-content: oklch(100% 0 0);
+	--color-success: oklch(65% 0.17 149.5);
+	--color-success-content: oklch(100% 0 0);
+	--color-warning: oklch(76% 0.15 70.1);
+	--color-warning-content: oklch(25% 0.02 60);
+	--color-error: oklch(60% 0.21 20.3);
+	--color-error-content: oklch(100% 0 0);
+
+	--radius-selector: 0.75rem;
+	--radius-field: 0.75rem;
+	--radius-box: 1rem;
+	--size-selector: 0.25rem;
+	--size-field: 0.25rem;
+	--border: 1px;
+	--depth: 1;
+	--noise: 0;
+}

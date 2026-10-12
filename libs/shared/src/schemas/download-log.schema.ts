@@ -44,6 +44,18 @@ export class DownloadLog {
   @Prop()
   storageDeletedAt?: Date;
 
+  /** Telegram CDN file identifier cached after a successful upload. */
+  @Prop({ index: true })
+  telegramFileId?: string;
+
+  /** Telegram chat the processed media was delivered to (bot flow). */
+  @Prop({ type: Number })
+  chatId?: number;
+
+  /** Telegram user id of the requester (bot / Mini App flow). */
+  @Prop({ type: Number, index: true })
+  telegramUserId?: number;
+
   @Prop()
   errorMessage?: string;
 

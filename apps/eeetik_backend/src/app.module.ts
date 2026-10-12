@@ -8,7 +8,10 @@ import {
   ThrottlerModule,
   ThrottlerModuleOptions,
 } from '@nestjs/throttler';
+import { buildBullMqConnectionOptions, readRedisCoreOptions } from '@shared';
 import { RedisThrottlerStorage } from './common/throttling/redis-throttler.storage';
+import { AuthModule } from './auth/auth.module';
+import { BotModule } from './bot/bot.module';
 import { DownloadModule } from './download/download.module';
 import { FilesModule } from './files/files.module';
 import { HealthModule } from './health/health.module';
@@ -17,12 +20,11 @@ import { RequestMetricsInterceptor } from './observability/request-metrics.inter
 
 const DEFAULT_THROTTLE_TTL_MS = 60_000;
 const DEFAULT_THROTTLE_LIMIT = 120;
-const DEFAULT_REDIS_HOST = '127.0.0.1';
-const DEFAULT_REDIS_PORT = 6_379;
 const DEFAULT_THROTTLE_REDIS_KEY_PREFIX = 'throttle';
-const HEALTH_AND_METRICS_CONTROLLERS = new Set([
+const HEALTH_METRICS_AND_BOT_CONTROLLERS = new Set([
   'HealthController',
   'MetricsController',
+  'BotController',
 ]);
 const EXPENSIVE_DOWNLOAD_HANDLERS = new Set([
   'DownloadController.getMetadata',
@@ -52,15 +54,13 @@ const EXPENSIVE_DOWNLOAD_HANDLERS = new Set([
     BullModule.forRootAsync({
       inject: [ConfigService],
       useFactory: (configService: ConfigService) => ({
-        connection: {
-          host: configService.get<string>('REDIS_HOST', '127.0.0.1'),
-          port: Number(configService.get<string>('REDIS_PORT', '6379')),
-          password: configService.get<string>('REDIS_PASSWORD') || undefined,
-        },
+        connection: buildBullMqConnectionOptions(configService),
       }),
     }),
     HealthModule,
     ObservabilityModule,
+    AuthModule,
+    BotModule,
     DownloadModule,
     FilesModule,
   ],
@@ -120,20 +120,21 @@ function buildThrottlerOptions(
     expensiveThrottleTtlMs,
   );
 
+  const redisCoreOptions = readRedisCoreOptions(configService);
   const throttleRedisHost = readStringConfig(
     configService,
     'THROTTLE_REDIS_HOST',
-    configService.get<string>('REDIS_HOST', DEFAULT_REDIS_HOST),
+    redisCoreOptions.host,
   );
   const throttleRedisPort = readPositiveIntegerConfig(
     configService,
     'THROTTLE_REDIS_PORT',
-    readPositiveIntegerConfig(configService, 'REDIS_PORT', DEFAULT_REDIS_PORT),
+    redisCoreOptions.port,
   );
   const throttleRedisPassword = readOptionalConfig(
     configService,
     'THROTTLE_REDIS_PASSWORD',
-    configService.get<string>('REDIS_PASSWORD'),
+    redisCoreOptions.password,
   );
   const throttleRedisKeyPrefix = readStringConfig(
     configService,
@@ -146,6 +147,7 @@ function buildThrottlerOptions(
       host: throttleRedisHost,
       port: throttleRedisPort,
       password: throttleRedisPassword,
+      tls: redisCoreOptions.tls,
       keyPrefix: throttleRedisKeyPrefix,
     }),
     throttlers: [
@@ -170,7 +172,7 @@ function buildThrottlerOptions(
 }
 
 function shouldSkipThrottlingForController(context: ExecutionContext): boolean {
-  return HEALTH_AND_METRICS_CONTROLLERS.has(context.getClass().name);
+  return HEALTH_METRICS_AND_BOT_CONTROLLERS.has(context.getClass().name);
 }
 
 function isExpensiveDownloadRequest(context: ExecutionContext): boolean {

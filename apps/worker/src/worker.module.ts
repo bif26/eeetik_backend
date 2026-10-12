@@ -4,18 +4,19 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { MongooseModule } from '@nestjs/mongoose';
 import {
+  buildBullMqConnectionOptions,
   DOWNLOAD_QUEUE_NAME,
   DownloadLog,
   DownloadLogSchema,
   TikTokMetadata,
   TikTokMetadataSchema,
-  UrlSigningService,
 } from '@shared';
 import { DownloadPrepareProcessor } from './processors/download-prepare.processor';
-import { WorkerRedisCacheService } from './services/worker-redis-cache.service';
 import { StorageRetentionService } from './services/storage-retention.service';
+import { TelegramStorageService } from './services/telegram-storage.service';
 import { WorkerMediaService } from './services/worker-media.service';
 import { WorkerObjectStorageService } from './services/worker-object-storage.service';
+import { WorkerRedisCacheService } from './services/worker-redis-cache.service';
 
 @Module({
   imports: [
@@ -36,11 +37,7 @@ import { WorkerObjectStorageService } from './services/worker-object-storage.ser
     BullModule.forRootAsync({
       inject: [ConfigService],
       useFactory: (configService: ConfigService) => ({
-        connection: {
-          host: configService.get<string>('REDIS_HOST', '127.0.0.1'),
-          port: Number(configService.get<string>('REDIS_PORT', '6379')),
-          password: configService.get<string>('REDIS_PASSWORD') || undefined,
-        },
+        connection: buildBullMqConnectionOptions(configService),
       }),
     }),
     BullModule.registerQueue({
@@ -62,7 +59,8 @@ import { WorkerObjectStorageService } from './services/worker-object-storage.ser
     StorageRetentionService,
     WorkerMediaService,
     WorkerRedisCacheService,
-    UrlSigningService,
+    TelegramStorageService,
+    // Retained for the dormant disk-retention path (legacy storageKey logs).
     WorkerObjectStorageService,
   ],
 })

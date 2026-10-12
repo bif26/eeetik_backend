@@ -6,6 +6,7 @@ interface RedisThrottlerStorageOptions {
   host: string;
   port: number;
   password?: string;
+  tls?: { rejectUnauthorized: boolean };
   keyPrefix: string;
 }
 
@@ -69,6 +70,7 @@ export class RedisThrottlerStorage
       host: options.host,
       port: options.port,
       password: options.password,
+      tls: options.tls,
       lazyConnect: true,
       maxRetriesPerRequest: 1,
       enableReadyCheck: true,

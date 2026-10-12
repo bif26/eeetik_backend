@@ -6,7 +6,13 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    ignores: ['eslint.config.mjs'],
+    // The Mini App (apps/miniapp) ships its own toolchain/format and is not
+    // covered by the NestJS lint rules; .svelte-kit holds generated files.
+    ignores: [
+      'eslint.config.mjs',
+      'apps/miniapp/**',
+      '**/*.spec.ts.snap',
+    ],
   },
   eslint.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked,

@@ -1,9 +1,6 @@
 import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
-import {
-  assertSignedUrlRuntimeConfig,
-  waitForCriticalDependencies,
-} from '@shared';
+import { waitForCriticalDependencies } from '@shared';
 import { config as loadEnv } from 'dotenv';
 import { WorkerModule } from './worker.module';
 
@@ -13,7 +10,6 @@ loadEnv({ path: '.env.local' });
 loadEnv({ path: '.env' });
 
 async function bootstrap(): Promise<void> {
-  assertSignedUrlRuntimeConfig({ serviceName: 'worker' });
   await waitForCriticalDependencies({ serviceName: 'worker' });
   await NestFactory.createApplicationContext(WorkerModule);
 }

@@ -1,0 +1,91 @@
+# Render Blueprint – Telegram-native, free-tier deployment
+#
+# Services:
+#   eeetik-api     – NestJS API + Telegram bot (web service, free plan)
+#   eeetik-worker  – BullMQ worker: download → /tmp → Telegram upload
+#   eeetik-miniapp – SvelteKit static Mini App (free static site)
+#
+# Notes:
+# - Render free web services sleep after 15 idle minutes; keep the bot on
+#   webhook mode (RENDER_EXTERNAL_URL is injected automatically) or add an
+#   external pinger if you prefer polling.
+# - If the `worker` + free plan is unavailable on your account, remove the
+#   worker service here and run processing inside the API service by leaving
+#   both `ENABLE_TELEGRAM_BOT=true` and the worker entrypoint unused
+#   (see README → "Single-service mode").
+services:
+  - type: web
+    name: eeetik-api
+    env: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start:prod
+    healthCheckPath: /api/v2/health/live
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ENABLE_TELEGRAM_BOT
+        value: 'true'
+      - key: UPSTASH_REDIS_HOST
+        sync: false
+      - key: UPSTASH_REDIS_PORT
+        value: '6379'
+      - key: UPSTASH_REDIS_PASSWORD
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_MINI_APP_URL
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: BOT_INTERNAL_SECRET
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: CORS_ORIGINS
+        value: https://eeetik-miniapp.onrender.com
+
+  - type: worker
+    name: eeetik-worker
+    env: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start:worker:prod
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ENABLE_TELEGRAM_BOT
+        value: 'false'
+      - key: WORKER_CONCURRENCY
+        value: '2'
+      - key: TEMP_DOWNLOAD_DIR
+        value: /tmp/eeetik-downloads
+      - key: UPSTASH_REDIS_HOST
+        sync: false
+      - key: UPSTASH_REDIS_PORT
+        value: '6379'
+      - key: UPSTASH_REDIS_PASSWORD
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_STORAGE_CHAT_ID
+        sync: false
+
+  - type: web
+    name: eeetik-miniapp
+    env: static
+    plan: free
+    buildCommand: cd apps/miniapp && npm ci && npm run build
+    staticPublishPath: apps/miniapp/build
+    envVars:
+      - key: PUBLIC_API_BASE_URL
+        value: https://eeetik-api.onrender.com
+    routes:
+      # SvelteKit SPA fallback – every path resolves to the app shell
+      - type: rewrite
+        source: /*
+        destination: /index.html

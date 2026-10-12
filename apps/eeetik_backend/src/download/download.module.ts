@@ -47,5 +47,6 @@ import { TikTokScraperService } from './services/tiktok-scraper.service';
     RedisCacheService,
     TikTokScraperService,
   ],
+  exports: [DownloadService],
 })
 export class DownloadModule {}

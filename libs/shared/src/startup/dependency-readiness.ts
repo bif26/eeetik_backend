@@ -1,6 +1,7 @@
 import { Logger } from '@nestjs/common';
 import Redis from 'ioredis';
 import mongoose from 'mongoose';
+import { readRedisCoreOptions } from '../config/redis-connection';
 
 const logger = new Logger('StartupReadiness');
 
@@ -8,8 +9,6 @@ const DEFAULT_STARTUP_MAX_WAIT_MS = 60_000;
 const DEFAULT_STARTUP_RETRY_INTERVAL_MS = 2_500;
 const DEFAULT_STARTUP_PROBE_TIMEOUT_MS = 3_000;
 const DEFAULT_MONGO_URI = 'mongodb://127.0.0.1:27017/eeetik';
-const DEFAULT_REDIS_HOST = '127.0.0.1';
-const DEFAULT_REDIS_PORT = 6379;
 
 interface WaitForCriticalDependenciesOptions {
   serviceName: string;
@@ -28,6 +27,7 @@ interface RedisProbeOptions {
   host: string;
   port: number;
   password?: string;
+  tls?: { rejectUnauthorized: boolean };
 }
 
 export async function waitForCriticalDependencies(
@@ -61,25 +61,24 @@ export async function waitForCriticalDependencies(
       'Start MongoDB and verify MONGO_URI. Local command: docker compose up -d mongodb',
   });
 
-  const redisHost = process.env.REDIS_HOST ?? DEFAULT_REDIS_HOST;
-  const redisPort = readPositiveNumberFromEnv('REDIS_PORT', DEFAULT_REDIS_PORT);
-  const redisPassword = process.env.REDIS_PASSWORD || undefined;
+  const redisOptions = readRedisCoreOptions();
   await waitForDependency({
     dependencyName: 'Redis',
-    target: `${redisHost}:${redisPort}`,
+    target: `${redisOptions.host}:${redisOptions.port}`,
     maxWaitMs,
     retryIntervalMs,
     check: () =>
       probeRedis(
         {
-          host: redisHost,
-          port: redisPort,
-          password: redisPassword,
+          host: redisOptions.host,
+          port: redisOptions.port,
+          password: redisOptions.password,
+          tls: redisOptions.tls,
         },
         probeTimeoutMs,
       ),
     troubleshootingTip:
-      'Start Redis and verify REDIS_HOST/REDIS_PORT. Local command: docker compose up -d redis',
+      'Verify UPSTASH_REDIS_HOST/UPSTASH_REDIS_PASSWORD (or REDIS_HOST/REDIS_PORT for local dev). Local command: docker compose up -d redis',
   });
 
   logger.log(`[${options.serviceName}] MongoDB and Redis are ready.`);
@@ -158,6 +157,7 @@ async function probeRedis(
     host: probeOptions.host,
     port: probeOptions.port,
     password: probeOptions.password,
+    tls: probeOptions.tls,
     lazyConnect: true,
     connectTimeout: timeoutMs,
     maxRetriesPerRequest: 1,

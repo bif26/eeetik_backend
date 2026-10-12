@@ -1,5 +1,6 @@
 import { Injectable, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { readRedisCoreOptions } from '@shared';
 import Redis from 'ioredis';
 
 const RELEASE_LOCK_LUA = `
@@ -14,10 +15,12 @@ export class RedisCacheService implements OnModuleDestroy {
   private readonly redisClient: Redis;
 
   constructor(private readonly configService: ConfigService) {
+    const connection = readRedisCoreOptions(this.configService);
     this.redisClient = new Redis({
-      host: this.configService.get<string>('REDIS_HOST', '127.0.0.1'),
-      port: Number(this.configService.get<string>('REDIS_PORT', '6379')),
-      password: this.configService.get<string>('REDIS_PASSWORD') || undefined,
+      host: connection.host,
+      port: connection.port,
+      password: connection.password,
+      tls: connection.tls,
       lazyConnect: true,
       maxRetriesPerRequest: 2,
       enableReadyCheck: true,

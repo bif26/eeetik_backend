@@ -41,6 +41,10 @@ export class TikTokMetadata {
   @Prop()
   thumbnailKey?: string;
 
+  /** Original TikTok CDN thumbnail URL (used for Telegram previews). */
+  @Prop()
+  thumbnailUrl?: string;
+
   @Prop({ type: [String], default: [] })
   imageKeys!: string[];
 

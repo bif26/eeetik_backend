@@ -428,6 +428,7 @@ describe('DownloadService prepare storage cap gate', () => {
       downloadLogAggregateExec,
       queueAdd,
     } = createService({
+      STORAGE_BACKEND: 'local',
       STORAGE_MAX_MONTHLY_BYTES: '1000',
     });
     const payload = {
@@ -464,6 +465,7 @@ describe('DownloadService prepare storage cap gate', () => {
       downloadLogCreate,
       queueAdd,
     } = createService({
+      STORAGE_BACKEND: 'local',
       STORAGE_MAX_MONTHLY_BYTES: '1000',
     });
     const payload = {
@@ -488,8 +490,9 @@ describe('DownloadService prepare storage cap gate', () => {
         requestType: payload.requestType,
       },
       expect.objectContaining({
-        removeOnComplete: 500,
-        removeOnFail: 1000,
+        removeOnComplete: true,
+        removeOnFail: 100,
+        attempts: 2,
       }),
     );
     expect(downloadLogCreate).toHaveBeenCalledWith(

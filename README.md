@@ -1,435 +1,245 @@
-# eeetik backend
+# eeetik_backend
 
-Secure and scalable NestJS backend for TikTok metadata + download workflows.
+NestJS backend for **eeetik** — TikTok metadata, downloads and delivery — now
+**Telegram-native** on a 100% free-tier cloud stack:
 
-## 🚀 Quick Start
-
-### Local Development
-
-1. Copy environment values:
-   ```bash
-   cp .env.example .env
-   ```
-
-2. Install dependencies:
-   ```bash
-   npm ci
-   ```
-
-3. Start local Redis (for development):
-   ```bash
-   # Using Docker (optional for local dev only)
-   docker run -d -p 6379:6379 redis:7-alpine
-   
-   # Or install Redis locally
-   # Ubuntu: sudo apt-get install redis-server
-   # macOS: brew install redis
-   ```
-
-4. Configure MongoDB Atlas:
-   - Create a free cluster at [MongoDB Atlas](https://www.mongodb.com/cloud/atlas)
-   - Get your connection string
-   - Update `MONGO_URI` in `.env`
-
-5. Run API and worker:
-   ```bash
-   npm run start:dev
-   npm run start:worker:dev
-   ```
-
-### Production Deployment
-
-Deploy to DigitalOcean Droplet with GitHub Actions:
-
-```bash
-# Configure GitHub Secrets (see Deployment Guide below)
-# Push to main branch triggers automatic deployment
-git push origin main
-```
-
-See the [Deployment Guide](#deployment-guide) for detailed setup instructions.
+- 🤖 **Telegram Bot** (grammY) is the primary interface — no web frontend required
+- 🖼 **Telegram Mini App** (SvelteKit + daisyUI) for rich UX inside Telegram
+- 📦 **Telegram CDN** as the media delivery layer (cached `file_id`s, zero disk usage)
+- ⚡ **Upstash Redis** (free tier) for BullMQ, caching, single-flight locks and rate limiting
+- 🍃 **MongoDB** (Atlas M0 / Render free) for metadata, download logs and users
+- 🚀 **Render** free tier for hosting (API + worker + static Mini App)
 
 ---
 
 ## Architecture
 
-### Services
-- **API service**: metadata fetch, prepare request, status polling, ad policy checks
-- **Worker service**: background media transfer, file processing, ZIP generation
-- **Redis**: metadata cache and BullMQ transport (self-hosted on server)
-- **MongoDB Atlas**: metadata + download logs (managed cloud service)
-- **Local Storage**: File storage on server disk
-
-### Sequence flow
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant Frontend
-    participant Backend
-    participant Redis
-    participant MongoDB
-    participant Scraper as @tobyg74/tiktok-api-dl
-    participant Bull as BullMQ Worker
-    participant Storage as Local Storage
-    participant TikTok as TikTok CDN
-
-    User->>Frontend: Paste TikTok URL
-    Frontend->>Backend: POST /api/v2/model/download/tiktok
-    Backend->>Redis: Lookup metadata cache
-    alt cache miss
-      Backend->>MongoDB: Lookup metadata
-      alt mongo miss
-        Backend->>Scraper: Fetch TikTok metadata
-        Scraper->>TikTok: Resolve source URLs
-        Scraper-->>Backend: Parsed metadata
-        Backend->>Storage: Save transformed thumbnail/images
-        Backend->>MongoDB: Save metadata + source URLs
-      end
-      Backend->>Redis: Cache metadata (24h)
-    end
-    Backend-->>Frontend: { success: true, data: preview metadata }
-
-    User->>Frontend: Choose HD/SD/Audio/ZIP
-    Frontend->>Backend: POST /api/v2/model/download/tiktok/prepare
-    Backend->>MongoDB: Insert download_log(status=processing)
-    Backend->>Bull: Enqueue job
-    Backend->>Backend: Wait up to ~7s for completion
-    alt completed quickly (cache hit/duplicate)
-      Backend-->>Frontend: { jobId, status: "completed", downloadUrl, filename, filesize, expiresIn }
-    else still processing
-      Backend-->>Frontend: { jobId, status: "processing" }
-    end
-
-    Bull->>MongoDB: Read metadata by uniqueId
-    alt HD/SD/Audio
-      Bull->>TikTok: Stream source media
-      Bull->>Storage: Save media file
-    else ZIP
-      Bull->>Storage: Read prepared images
-      Bull->>Bull: Build ZIP archive
-      Bull->>Storage: Save ZIP file
-    end
-    Bull->>Backend: Generate download URL
-    Bull->>MongoDB: Update download_log(status=completed, downloadUrl)
-
-    Frontend->>Backend: GET /api/v2/model/download/tiktok/status/:jobId
-    Backend-->>Frontend: processing/completed + downloadUrl
+```
+                    ┌────────────────────────┐
+   TikTok URL ────▶ │  Telegram Bot (grammY) │──▶ metadata preview + quality keyboard
+                    │  (inside eeetik-api)   │──▶ enqueue BullMQ job (chatId attached)
+                    └───────────┬────────────┘
+                                │
+   Telegram Mini App ── REST ─▶ │  eeetik-api (NestJS)
+   (SvelteKit + daisyUI)        │   • /api/v2/model/download/tiktok/*
+                                │   • /api/v2/auth/telegram, /api/v2/auth/me
+                                │   • BotOrMiniAppGuard (tma initData | JWT | bot secret)
+                                ▼
+                    ┌────────────────────────┐
+                    │  Upstash Redis (free)  │  BullMQ queue + metadata cache + locks
+                    └───────────┬────────────┘
+                                ▼
+                    ┌────────────────────────┐
+                    │  eeetik-worker (BullMQ)│  download ─▶ /tmp ─▶ Telegram upload
+                    │  concurrency: 2        │  ─▶ file_id cached in Redis ─▶ rm -rf /tmp
+                    └───────────────────────┘
 ```
 
-## API endpoints
+**Delivery flow (worker):**
 
-- `POST /api/v2/model/download/tiktok`
-  - Body: `{ "url": "https://www.tiktok.com/..." }`
-  - Returns `{ success: true, data }` where `data` includes `uniqueId`, `type`, `author`, `stats`, `hashtags`, `availableFormats`
-  - `type: "video"` includes `thumbnail` + `duration` (no direct TikTok CDN URLs are returned)
-  - `type: "image"` includes signed image URLs
-- `POST /api/v2/model/download/tiktok/prepare`
-  - Body: `{ "uniqueId": "...", "requestType": "hd|sd|audio|zip", "adToken": "...", "adDurationSeconds": 30 }`
-  - Returns one of:
-    - `{ jobId, status: "completed", downloadUrl, filename, filesize, expiresIn }`
-    - `{ jobId, status: "processing" }` (use status endpoint to poll)
-- `GET /api/v2/model/download/tiktok/status/:jobId`
-  - Returns job status and download URL when complete
-- `GET /api/v2/files/:uniqueId/:filename?expires=...&sig=...`
-  - Serves signed local files
-- `GET /api/v2/health/live`
-- `GET /api/v2/health/ready`
-- `GET /api/v2/metrics` (Prometheus format)
+```
+download to /tmp/eeetik-downloads
+  → file_id cache hit?  ── yes ─▶ send cached file_id to chat (instant) ─▶ done
+        │ no
+  → upload to Telegram chat (sendVideo / sendAudio / sendDocument)
+  → cache file_id (TTL 24h) ─▶ temp dir deleted (finally, always)
+```
 
-## Deployment Guide
+Render free tier has **no persistent disk** — nothing is ever written outside
+`/tmp`, and every job cleans up after itself.
 
-### Prerequisites
+### Monorepo layout
 
-1. **DigitalOcean Droplet**
-   - Ubuntu 22.04 LTS or later
-   - Minimum 2GB RAM, 1 CPU, 25GB SSD
-   - Recommended: 4GB RAM, 2 CPUs, 50GB SSD
+| Path | Description |
+|---|---|
+| `apps/eeetik_backend` | NestJS API: metadata, prepare/status endpoints, bot, auth, health, metrics |
+| `apps/worker` | BullMQ worker: download → Telegram upload pipeline |
+| `apps/miniapp` | SvelteKit 2 + Svelte 5 + Tailwind 4 + daisyUI Mini App |
+| `libs/shared` | Shared schemas (Mongoose), Redis connection helper, logging, readiness probes |
 
-2. **MongoDB Atlas** (Free tier available)
-   - Create cluster at [https://www.mongodb.com/cloud/atlas](https://www.mongodb.com/cloud/atlas)
-   - Get connection string
-   - Whitelist Droplet IP address
+### Key API endpoints (prefix `/api/v2`)
 
-3. **GitHub Repository Secrets**
-   Configure these secrets in your GitHub repository (Settings → Secrets and variables → Actions):
-   - `DROPLET_HOST`: Your Droplet's IP address
-   - `DROPLET_USERNAME`: SSH username (usually `root`)
-   - `DROPLET_SSH_KEY`: Private SSH key for authentication
-   - `DROPLET_PORT`: SSH port (default: 22)
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/model/download/tiktok` | Bot / Mini App | Fetch TikTok metadata preview |
+| POST | `/model/download/tiktok/prepare` | Bot / Mini App | Enqueue a download job (REST flow) |
+| GET | `/model/download/tiktok/status/:jobId` | Bot / Mini App | Poll job status |
+| GET | `/model/download/tiktok/history` | Bot / Mini App | Recent downloads (Mini App library) |
+| POST | `/auth/telegram` | tma initData | Exchange initData for a JWT |
+| GET/PATCH | `/auth/me` | Bot / Mini App | User profile + Mini App settings |
+| POST | `/bot/webhook` | webhook secret | Telegram webhook receiver |
+| GET | `/health/live`, `/health/ready` | public | Health probes (Render health check) |
 
-### Droplet Initial Setup
+**`BotOrMiniAppGuard`** accepts (in order):
+1. `X-Bot-Secret: <BOT_INTERNAL_SECRET>` — bot-internal calls
+2. `Authorization: tma <initData>` — Telegram-signed Mini App payload
+3. `Authorization: Bearer <jwt>` — token issued by `POST /auth/telegram`
 
-SSH into your Droplet and run:
+Verified callers skip the legacy ad gate; unauthenticated traffic is rejected
+with 401.
+
+---
+
+## Deployment (Render free tier)
+
+The repo ships a **Render Blueprint** (`render.yaml`) with three services:
+
+1. `eeetik-api` — web service (Node), health check `/api/v2/health/live`
+2. `eeetik-worker` — background worker running `start:worker:prod`
+3. `eeetik-miniapp` — static site built from `apps/miniapp/build`
+
+### Steps
+
+1. **Fork/push this repo to GitHub**, then in Render: **New → Blueprint** and
+   select the repo. Render creates all three services.
+2. **Create Upstash Redis** (free): [console.upstash.com](https://console.upstash.com)
+   → Create database (Regional, EV0 free tier) → copy the endpoint host and
+   password into `UPSTASH_REDIS_HOST` / `UPSTASH_REDIS_PASSWORD` on both
+   Render services.
+3. **Create MongoDB** (free): Atlas M0 cluster (or Render MongoDB) → copy the
+   connection string into `MONGO_URI`. Whitelist Render egress (`0.0.0.0/0`
+   for Atlas free).
+4. **Create the bot with @BotFather**:
+   - `/newbot` → choose a name + username → copy the token into
+     `TELEGRAM_BOT_TOKEN`
+   - Set the Mini App: `/newapp` (or *Bot Settings → Menu Button*) → paste your
+     `eeetik-miniapp.onrender.com` URL → also set it as
+     `TELEGRAM_MINI_APP_URL` on the API service.
+5. **Generate secrets** and set them on the API service:
+   - `BOT_INTERNAL_SECRET`, `JWT_SECRET`, `TELEGRAM_WEBHOOK_SECRET`
+     (`openssl rand -hex 32` each).
+6. **Deploy** — the bot auto-detects `RENDER_EXTERNAL_URL` and registers the
+   webhook at `https://<api-host>/api/v2/bot/webhook`. Test with `/start`.
+
+> **Webhook vs polling:** when `RENDER_EXTERNAL_URL` (or
+> `TELEGRAM_WEBHOOK_URL`) is present the bot uses webhooks; otherwise it falls
+> back to long polling. Force either with `TELEGRAM_WEBHOOK_URL` or by
+> leaving both unset.
+
+> **Single-service mode:** Render free background workers may be gated on some
+> accounts. If so, delete the `eeetik-worker` block in `render.yaml` and run
+> `npm run start:worker:prod` as a second **web** service (it only needs
+> `/api/v2/health/live` to respond — add the health module if you go this
+> route), or simply keep the default blueprint.
+
+---
+
+## Mini App development
 
 ```bash
-# Update system
-sudo apt update && sudo apt upgrade -y
-
-# Install Node.js 22
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-sudo apt-get install -y nodejs
-
-# Install PM2 globally
-sudo npm install -g pm2
-
-# Install Redis
-sudo apt install redis-server -y
-sudo systemctl enable redis-server
-sudo systemctl start redis-server
-
-# Configure Redis (optional: set password, persistence)
-sudo nano /etc/redis/redis.conf
-# Uncomment and set: requirepass your_strong_password
-# Save and restart: sudo systemctl restart redis-server
-
-# Create deployment directory
-sudo mkdir -p /var/www/eeetik_backend
-sudo chown -R $USER:$USER /var/www/eeetik_backend
-
-# Setup PM2 startup script
-pm2 startup
-# Run the command it outputs
-
-# Setup firewall
-sudo ufw allow 22/tcp
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
-sudo ufw enable
+cd apps/miniapp
+npm install
+npm run dev            # SvelteKit dev server
 ```
 
-### Environment Configuration
+- Pages: `/` (paste URL), `/preview` (metadata + quality), `/queue`
+  (job polling), `/library` (past downloads), `/settings`
+- UI: daisyUI 5 components with a custom `telegram` theme; light/dark follows
+  Telegram's `themeParams`
+- All API calls attach `Authorization: tma <initData>` automatically
+- Storage: **Telegram CloudStorage via the SDK** — `localStorage` is not used
+- Point it at a local API with a `.env` file:
+  `PUBLIC_API_BASE_URL=http://localhost:3000`
 
-Create `.env` file on your Droplet at `/var/www/eeetik_backend/.env`:
+To try it inside Telegram without deploying, expose the dev server with a
+tunnel (e.g. `ngrok http 5173`) and set that URL in BotFather → Menu Button.
+
+---
+
+## Local development (bot + API + worker)
 
 ```bash
-NODE_ENV=production
-PORT=3000
-API_PREFIX=api/v2
-CORS_ORIGINS=https://yourdomain.com
-SITE_DOMAIN_ALLOWLIST=yourdomain.com
-API_PUBLIC_BASE_URL=https://api.yourdomain.com
-REQUEST_BODY_LIMIT=1mb
-LOG_LEVEL=info
-LOG_DIR=./logs
-
-# MongoDB Atlas connection string
-MONGO_URI=mongodb+srv://username:password@cluster.mongodb.net/eeetik?retryWrites=true&w=majority
-
-# Local Redis
-REDIS_HOST=127.0.0.1
-REDIS_PORT=6379
-REDIS_PASSWORD=your_redis_password
-
-# Throttle settings
-THROTTLE_TTL_MS=60000
-THROTTLE_LIMIT=120
-THROTTLE_EXPENSIVE_TTL_MS=60000
-THROTTLE_EXPENSIVE_LIMIT=30
-
-# Local file storage
-STORAGE_PATH=./data/uploads
-STORAGE_MAX_MONTHLY_BYTES=10737418240
-FILE_CLEANUP_ENABLED=true
-FILE_CLEANUP_TTL_HOURS=1
-URL_SIGNING_SECRET=your-32-char-min-secret
-SIGNED_URL_EXPIRY_SECONDS=600
-
-# Metadata cache
-METADATA_CACHE_TTL_SECONDS=86400
-METADATA_CACHE_URL_TTL_SECONDS=86400
-METADATA_CACHE_UID_TTL_SECONDS=86400
-CDN_URL_CACHE_TTL_SECONDS=3600
-METADATA_SINGLEFLIGHT_LOCK_TTL_MS=15000
-METADATA_SINGLEFLIGHT_WAIT_RETRY_MS=150
-METADATA_SINGLEFLIGHT_MAX_RETRIES=40
-
-# Ad policy
-AD_HD_MIN_SECONDS=30
-AD_SD_MIN_SECONDS=15
-AD_AUDIO_MIN_SECONDS=10
-AD_ZIP_MIN_SECONDS=20
-
-# Prepare response window + duplicate request lock behavior
-PREPARE_WAIT_TIMEOUT_MS=7000
-PREPARE_WAIT_POLL_INTERVAL_MS=250
-DOWNLOAD_LOCK_TTL_MS=15000
-DOWNLOAD_LOCK_WAIT_MS=7000
-DOWNLOAD_LOCK_WAIT_POLL_MS=250
+cp .env.example .env.local        # fill in Upstash/Mongo/bot token
+npm install
+npm run start:dev                 # API + bot (polling) on :3000
+npm run start:worker:dev          # worker in a second terminal
 ```
 
-### Deployment Addendum (Storage + Signed URLs)
+The bot works with a local Redis via `UPSTASH_REDIS_TLS=false` +
+`REDIS_HOST=127.0.0.1` (see comments in `.env.example`).
 
-1. Generate and set a strong `URL_SIGNING_SECRET` (minimum 32 characters).
-2. Ensure `STORAGE_PATH` has write permissions for both API and worker processes.
-3. Verify Redis persistence is enabled (required for metadata/CDN cache and lock continuity).
-4. Monitor disk usage (`du -sh /var/www/eeetik_backend/data/uploads`) and tune:
-   - `FILE_CLEANUP_TTL_HOURS`
-   - `STORAGE_MAX_MONTHLY_BYTES`
-5. Validate signed file delivery:
-   - Request metadata
-   - Trigger prepare
-   - Confirm `downloadUrl` is `/api/v2/files/{uniqueId}/{filename}?expires=...&sig=...`
-6. Validate duplicate handling:
-   - Send 2 prepare requests for same `uniqueId` + `requestType`
-   - Confirm second request reuses existing file or waits for same locked result
+### Scripts
 
-### Deploy with GitHub Actions
+| Command | Description |
+|---|---|
+| `npm run build` | Build shared lib + API + worker |
+| `npm run start:prod` | Start API from `dist` |
+| `npm run start:worker:prod` | Start worker from `dist` |
+| `npm run lint` | ESLint (auto-fix) |
+| `npm run test` | Jest unit tests |
+| `npm run test:e2e` | API + worker e2e suites |
 
-1. Push to main branch:
-   ```bash
-   git push origin main
-   ```
+### Environment variables
 
-2. GitHub Actions will automatically:
-   - Build the application
-   - Transfer files to your Droplet
-   - Restart PM2 services
+See [`.env.example`](.env.example) for the complete, commented list. The most
+important additions in this migration:
 
-3. Monitor deployment:
-   - Check GitHub Actions tab for deployment status
-   - SSH to Droplet and run `pm2 logs` to view application logs
+| Variable | Purpose |
+|---|---|
+| `UPSTASH_REDIS_HOST` / `UPSTASH_REDIS_PASSWORD` | Upstash Redis endpoint (TLS auto-enabled) |
+| `TELEGRAM_BOT_TOKEN` | BotFather token |
+| `TELEGRAM_MINI_APP_URL` | Public Mini App URL (used in bot keyboards) |
+| `TELEGRAM_FILE_ID_CACHE_TTL` | Redis TTL for cached file_ids (default 24 h) |
+| `TELEGRAM_MAX_UPLOAD_MB` | Upload size guard (default 49 MB, bot API limit) |
+| `TELEGRAM_STORAGE_CHAT_ID` | Optional fallback chat for jobs without a chatId |
+| `TELEGRAM_WEBHOOK_URL` / `TELEGRAM_WEBHOOK_SECRET` | Webhook mode override + secret |
+| `ENABLE_TELEGRAM_BOT` | `false` on the worker service |
+| `TEMP_DOWNLOAD_DIR` | Worker temp dir (default `/tmp/eeetik-downloads`) |
+| `WORKER_CONCURRENCY` | BullMQ worker concurrency (default 2) |
+| `BOT_INTERNAL_SECRET` | Shared secret for bot-internal REST calls |
+| `JWT_SECRET` / `JWT_EXPIRES_IN` | Mini App JWT session tokens |
 
-### Manual Deployment
+Removed: `STORAGE_PATH`, `STORAGE_MAX_MONTHLY_BYTES`, `URL_SIGNING_SECRET`,
+`SIGNED_URL_EXPIRY_SECONDS` (local-disk + signed-URL delivery is replaced by
+Telegram CDN `file_id` caching; set `STORAGE_BACKEND=local` to revive the
+legacy path for local experiments).
 
-If you need to deploy manually:
+---
 
-```bash
-# On your local machine
-npm ci
-npm run build
-tar -czf deploy.tar.gz dist node_modules package.json ecosystem.config.js
+## Bot usage
 
-# Copy to Droplet
-scp deploy.tar.gz user@droplet_ip:/var/www/eeetik_backend/
+| Command | Behavior |
+|---|---|
+| `/start` | Welcome + inline **🎵 Open Mini App** button |
+| `/help` | Supported platforms + command list |
+| `/download <url>` | Fetch metadata directly |
+| paste a TikTok URL | Preview card + quality inline keyboard |
+| `quality:{uniqueId}:{hd\|sd\|audio\|zip}` | Enqueue the job; media is delivered to the chat |
+| Mini App `web_app_data` | Verified payload triggers preview / direct enqueue |
 
-# On Droplet
-cd /var/www/eeetik_backend
-tar -xzf deploy.tar.gz
-pm2 restart ecosystem.config.js
-pm2 save
+Quality keyboard (video posts):
+
+```
+[ HD 1080p ] [ SD 720p ]
+[ Audio MP3 ]
+[ 🔙 Back ]
 ```
 
-### Setup Nginx (Optional but Recommended)
+Image posts get `[ Images ZIP ]` + `[ Audio MP3 ]` instead.
 
-For production, use Nginx as reverse proxy:
+## CI
 
-```bash
-sudo apt install nginx -y
+`.github/workflows/ci.yml` runs lint, unit tests and the full build on every
+push/PR. Render auto-deploys from Git — no SSH/PM2 pipeline anymore (the old
+PM2 config `ecosystem.config.js` was removed in this migration). The legacy
+Droplet deploy workflow (`.github/workflows/deploy.yml`) is retained only
+because the deployment PAT used for this migration lacks the GitHub
+`workflow` scope required to delete workflow files — **delete it via the
+GitHub UI after merging** (it is inert on this branch and its Droplet secrets
+no longer exist).
 
-# Create Nginx config
-sudo nano /etc/nginx/sites-available/eeetik
-```
+## Testing checklist
 
-Nginx configuration:
-
-```nginx
-server {
-    listen 80;
-    server_name api.yourdomain.com;
-
-    client_max_body_size 100M;
-
-    location / {
-        proxy_pass http://localhost:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_cache_bypass $http_upgrade;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
-Enable and restart:
-
-```bash
-sudo ln -s /etc/nginx/sites-available/eeetik /etc/nginx/sites-enabled/
-sudo nginx -t
-sudo systemctl restart nginx
-
-# Install SSL with Let's Encrypt
-sudo apt install certbot python3-certbot-nginx -y
-sudo certbot --nginx -d api.yourdomain.com
-```
-
-### Monitoring and Maintenance
-
-```bash
-# View PM2 status
-pm2 status
-
-# View logs
-pm2 logs
-pm2 logs eeetik-api
-pm2 logs eeetik-worker
-
-# Restart services
-pm2 restart all
-
-# Monitor resources
-pm2 monit
-
-# Check disk usage
-df -h
-du -sh /var/www/eeetik_backend/data/uploads
-
-# Redis status
-redis-cli ping
-redis-cli info
-```
-
-## Build, test, lint
-
-```bash
-npm run lint
-npm run test -- --runInBand
-npm run build
-npm run loadtest:k6:seed
-npm run loadtest:k6
-```
-
-## Load validation
-
-Run e2e load validation against your deployed server:
-
-```bash
-LOADTEST_MODE=e2e BASE_URL=https://api.yourdomain.com SAMPLE_TIKTOK_URL=https://www.tiktok.com/@.../video/... npm run loadtest:k6:e2e
-```
-
-Set `STORAGE_MAX_MONTHLY_BYTES` to your storage policy limit before running production traffic. When current-month storage usage reaches this limit, new prepare requests are paused until the limit is increased.
-
-## Troubleshooting
-
-### Storage Issues
-- **Disk full**: Monitor disk usage with `df -h` and clean old files from `STORAGE_PATH`
-- **Permission denied**: Ensure the deployment user owns the storage directory
-- **Files not found**: Check that `STORAGE_PATH` is correctly configured in `.env`
-
-### Redis Connection Issues
-- **Connection refused**: Check Redis is running: `sudo systemctl status redis-server`
-- **Authentication failed**: Verify `REDIS_PASSWORD` in `.env` matches Redis configuration
-
-### MongoDB Atlas Issues
-- **Connection timeout**: Whitelist your Droplet's IP in MongoDB Atlas Network Access
-- **Authentication failed**: Verify connection string and credentials
-
-### PM2 Issues
-- **Process not starting**: Check PM2 logs: `pm2 logs`
-- **Out of memory**: Increase `max_memory_restart` in `ecosystem.config.js`
-- **Auto-restart loop**: Check application logs for startup errors
-
-## Security notes
-
-- Keep storage files secure with proper file permissions
-- Use strong Redis password in production
-- Route traffic through Nginx with TLS/SSL
-- Set strict `SITE_DOMAIN_ALLOWLIST` and `CORS_ORIGINS` for your frontend domain(s)
-- Keep secrets in environment variables, not in source code
-- Regularly update Node.js and npm packages
-- Monitor server logs for suspicious activity
-- Implement file retention policies to manage disk usage
-- Consider using MongoDB Atlas IP whitelist for additional security
+- [x] `npm run build` succeeds
+- [x] `npm run lint` passes
+- [x] `npm run test` passes (46 specs incl. initData HMAC + guard suites)
+- [ ] Bot responds to `/start` with Mini App button *(needs live token)*
+- [ ] Bot fetches TikTok metadata from a URL *(needs live token)*
+- [ ] Quality keyboard shows correct options *(unit-tested)*
+- [ ] Download job completes and media is sent to Telegram *(needs live token)*
+- [ ] `file_id` caching works (second request is instant) *(needs live token)*
+- [ ] Mini App loads in Telegram WebView *(needs deployed static site)*
+- [ ] Mini App auth via `initData` works *(HMAC verified by unit tests)*
+- [ ] Mini App respects light/dark theme
+- [ ] Health endpoints respond (`/api/v2/health/live`)
+- [ ] No files remain in `/tmp` after job completion (cleanup is in `finally`)

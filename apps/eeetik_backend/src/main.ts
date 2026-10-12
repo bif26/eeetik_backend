@@ -1,10 +1,7 @@
 import { Logger, ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
-import {
-  assertSignedUrlRuntimeConfig,
-  waitForCriticalDependencies,
-} from '@shared';
+import { waitForCriticalDependencies } from '@shared';
 import { config as loadEnv } from 'dotenv';
 import { json, urlencoded } from 'express';
 import helmet from 'helmet';
@@ -16,7 +13,6 @@ loadEnv({ path: '.env.local' });
 loadEnv({ path: '.env' });
 
 async function bootstrap(): Promise<void> {
-  assertSignedUrlRuntimeConfig({ serviceName: 'api' });
   await waitForCriticalDependencies({ serviceName: 'api' });
 
   const app = await NestFactory.create(AppModule);

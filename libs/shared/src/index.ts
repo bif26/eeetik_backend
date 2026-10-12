@@ -1,4 +1,5 @@
 export * from './constants/download.constants';
+export * from './config/redis-connection';
 export * from './enums/download-request-type.enum';
 export * from './enums/download-status.enum';
 export * from './enums/post-type.enum';
@@ -7,6 +8,7 @@ export * from './interfaces/tiktok-scrape-result.interface';
 export * from './logging/structured-logger';
 export * from './schemas/download-log.schema';
 export * from './schemas/tiktok-metadata.schema';
+export * from './schemas/user.schema';
 export * from './signing/signed-cdn-url';
 export * from './signing/signed-url-runtime-config';
 export * from './startup/dependency-readiness';
