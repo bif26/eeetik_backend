@@ -122,6 +122,25 @@ The repo ships a **Render Blueprint** (`render.yaml`) with three services:
 > `/api/v2/health/live` to respond — add the health module if you go this
 > route), or simply keep the default blueprint.
 
+### Automatic deploys (push to main → live on Render)
+
+Two layers of automation are wired up:
+
+1. **Render autoDeploy (always on).** All three blueprint services set
+   `autoDeploy: true`, so every push to `main` triggers a fresh build + deploy
+   on Render with zero extra configuration.
+2. **GitHub Actions deploy hooks (optional).** A ready-made workflow lives at
+   `docs/github-actions/deploy.yml`. Copy it to `.github/workflows/deploy.yml`
+   and add the optional repository secrets `RENDER_DEPLOY_HOOK_API`,
+   `RENDER_DEPLOY_HOOK_WORKER`, `RENDER_DEPLOY_HOOK_MINIAPP` (Render → service
+   → Settings → Deploy Hook). On every push to `main` it pings all three hooks
+   so the services redeploy in sync. Without the secrets it exits gracefully.
+   > Note: updating files under `.github/workflows/` requires a token with the
+   > `workflow` scope (fine-grained PATs need the *Workflows* permission). The
+   > legacy DigitalOcean/PM2 workflow in `.github/workflows/deploy.yml` is
+   > obsolete — replace it with the template above (or disable it in the
+   > Actions tab) with such a token.
+
 ---
 
 ## Mini App development
