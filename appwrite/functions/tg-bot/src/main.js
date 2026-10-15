@@ -32,6 +32,11 @@ const ENV = {
   botToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
   webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET ?? '',
   miniAppUrl: process.env.TELEGRAM_MINI_APP_URL ?? '',
+  allowedUserIds: (process.env.TELEGRAM_ALLOWED_USER_IDS ?? '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean),
+  bucketId: process.env.APPWRITE_BUCKET_ID ?? '',
   initdataMaxAge: Number(process.env.TELEGRAM_INIT_DATA_MAX_AGE_SECONDS ?? 86400),
 };
 const DATABASE_ID = 'eeetik';
@@ -257,6 +262,35 @@ function escapeHtml(text) {
 }
 
 async function registerBot(bot) {
+  // Private-bot allowlist (TELEGRAM_ALLOWED_USER_IDS, comma separated).
+  // Delete the variable to make the bot public.
+  bot.use(async (ctx, next) => {
+    if (!ENV.allowedUserIds.length) return next();
+    const fromId = String(ctx.from?.id ?? '');
+    if (fromId && ENV.allowedUserIds.includes(fromId)) return next();
+    if (ctx.callbackQuery) {
+      try {
+        await ctx.answerCallbackQuery({ text: '🔒 This bot is private.', show_alert: true });
+      } catch {
+        /* already answered */
+      }
+      return;
+    }
+    await ctx.reply('🔒 This is a private bot. Ask the owner for access.').catch(() => {});
+  });
+
+  bot.command('id', (ctx) =>
+    ctx.reply(
+      [
+        '🪪 <b>Your IDs</b>',
+        `User: <code>${ctx.from?.id ?? '?'}</code>`,
+        `Chat: <code>${ctx.chat?.id ?? '?'}</code>`,
+        '',
+        'Send the User ID to the bot owner to get access.',
+      ].join('\n'),
+      { parse_mode: 'HTML' },
+    ));
+
   bot.command('start', (ctx) =>
     ctx.reply(
       [
@@ -329,21 +363,39 @@ async function registerBot(bot) {
     }
   });
 
-  bot.callbackQuery(/^quality:(.+):(back)$/, async (ctx) => {
+  bot.callbackQuery(/^quality:(\w+):(back)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     await ctx.reply('👇 Send me a TikTok link or open the Mini App.', {
       reply_markup: mainKeyboard(),
     });
   });
 
-  bot.callbackQuery(/^quality:(.+):(hd|hd720|sd|sd360|audio|zip)$/, async (ctx) => {
-    const [, uniqueId, quality] = ctx.match;
+  bot.callbackQuery(/^quality:(\w+):(hd|hd720|sd|sd360|audio|zip)$/, async (ctx) => {
+    const [, hash, quality] = ctx.match;
     const spec = QUALITIES[quality];
     try {
       await ctx.answerCallbackQuery();
+      // Resolve the ORIGINAL video URL from the metadata cache (the callback
+      // payload only carries the 12-char cache key).
+      let jobUrl = '';
+      let uniqueId = hash;
+      try {
+        const metaRow = await getRow('meta', hash);
+        const cached = JSON.parse(metaRow.payload);
+        jobUrl = cached.url ?? '';
+        uniqueId = cached.uniqueId ?? uniqueId;
+      } catch {
+        /* expired / missing */
+      }
+      if (!jobUrl) {
+        await ctx
+          .editMessageText('⌛ This preview expired — send me the TikTok link again.')
+          .catch(() => {});
+        return;
+      }
       await ctx.editMessageText(`⏳ Preparing <b>${spec.label}</b>…`, { parse_mode: 'HTML' });
       await createRow('jobs', {
-        url: `https://www.tiktok.com/@${uniqueId}`,
+        url: jobUrl,
         uniqueId,
         quality,
         kind: spec.kind,
@@ -429,10 +481,13 @@ async function pollOnce(log) {
 async function handleLink(ctx, url) {
   const waitMsg = await ctx.reply('🔎 Fetching metadata…');
   try {
-    const preview = await getCachedPreview(url, crypto.createHash('sha1').update(url).digest('hex').slice(0, 12));
+    const hash = crypto.createHash('sha1').update(url).digest('hex').slice(0, 12);
+    const preview = await getCachedPreview(url, hash);
     await ctx.deleteMessage(waitMsg.message_id).catch(() => {});
     const caption = formatCaption(preview);
-    const keyboard = qualityKeyboard(preview.uniqueId);
+    // The keyboard carries the cache key; the callback resolves the video URL
+    // from the meta row (see quality callback handler).
+    const keyboard = qualityKeyboard(hash);
     if (preview.thumbnailUrl) {
       await ctx.replyWithPhoto(preview.thumbnailUrl, {
         caption,
@@ -445,7 +500,7 @@ async function handleLink(ctx, url) {
   } catch (err) {
     logSafe(err);
     await ctx
-      .editMessageText('⚠️ Could not fetch this link. It may be private, removed or unsupported.')
+      .reply('⚠️ Could not fetch this link. It may be private, removed or unsupported.')
       .catch(() => {});
   }
 }
@@ -564,8 +619,21 @@ async function handleDownload(body, awUserId) {
   if ((job.appwriteUserId ?? '') !== awUserId) {
     return { status: 403, payload: { ok: false, error: 'Not your job' } };
   }
-  if (job.status !== 'completed' || !job.fileId) {
+  if (job.status !== 'completed' || (!job.fileId && !job.appwriteFileId)) {
     return { status: 409, payload: { ok: false, error: `Job is ${job.status}` } };
+  }
+  // Prefer the permanent Appwrite Storage copy (never expires) over the
+  // 1-hour Telegram file URL.
+  if (job.appwriteFileId && ENV.bucketId) {
+    return {
+      status: 200,
+      payload: {
+        ok: true,
+        kind: job.kind,
+        source: 'bucket',
+        url: `${ENV.endpoint}/storage/buckets/${ENV.bucketId}/files/${job.appwriteFileId}/view?project=${ENV.projectId}`,
+      },
+    };
   }
   const bot = makeBot();
   const file = await bot.api.getFile(job.fileId);
@@ -574,6 +642,7 @@ async function handleDownload(body, awUserId) {
     payload: {
       ok: true,
       kind: job.kind,
+      source: 'telegram',
       url: `https://api.telegram.org/file/bot${ENV.botToken}/${file.file_path}`,
     },
   };

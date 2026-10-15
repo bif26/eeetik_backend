@@ -88,8 +88,9 @@ that runs entirely on Appwrite Cloud — no Render/Heroku/Redis needed:
 | Resource | Id | Role |
 |---|---|---|
 | TablesDB database | `eeetik` | tables: `users`, `jobs`, `files`, `meta`, `history` |
-| Function | `tg-bot` (every-minute schedule) | Telegram bot UX (/start, /help, link → preview → quality keyboard, callbacks, web_app_data) **+** Mini App API (`auth`, `metadata`, `prepare`, `jobs`, `download`, `history`, `settings`) |
-| Function | `tg-processor` (event + 5-min sweep) | row event `jobs.rows.*.create` → scrape → download to /tmp → upload to Telegram → cache `file_id` → deliver |
+| Storage bucket | `6ad1172800034a06bcf5` ("rr") | permanent media copies — every delivered file also lands here; messages carry a non-expiring **⬇️ Save file** button (`/storage/.../view` link, bucket has `read("any")`) |
+| Function | `tg-bot` (every-minute schedule) | Telegram bot UX (/start, /help, /id, link → preview → quality keyboard, callbacks, web_app_data) **+** Mini App API (`auth`, `metadata`, `prepare`, `jobs`, `download`, `history`, `settings`) |
+| Function | `tg-processor` (event + 5-min sweep) | row event `jobs.rows.*.create` → scrape → download to /tmp → upload to Appwrite bucket → upload to Telegram → cache `file_id` + `appwriteFileId` → deliver |
 | Site | `miniapp` | SvelteKit Mini App (daisyUI) |
 | Auth | Appwrite Auth | Telegram initData → HMAC-validated → Appwrite user `tg_<id>` + session |
 
@@ -99,11 +100,13 @@ that runs entirely on Appwrite Cloud — no Render/Heroku/Redis needed:
 2. `tg-bot` returns a rich preview + quality keyboard; picking a quality creates
    a `jobs` row (status `queued`).
 3. The row-create event triggers `tg-processor`: it downloads the media to the
-   function's /tmp, uploads it via the Bot API (49 MB guard, SD fallback,
-   Images ZIP via archiver), caches the returned `file_id` in the `files`
-   table, and marks the job `completed` (chat delivery + history row).
+   function's /tmp, uploads a permanent copy to Storage bucket `6ad1172800034a06bcf5`,
+   uploads it via the Bot API (49 MB guard, SD fallback, Images ZIP via
+   archiver), caches the returned `file_id` **and** `appwriteFileId` in the
+   `files` table, and marks the job `completed` (chat delivery + history row).
 4. The Mini App polls job status through `tg-bot` and gets a direct
-   `api.telegram.org/file/…` playback link for its own downloads.
+   `api.telegram.org/file/…` playback link (bucket view link preferred —
+   it never expires).
 
 **Bot delivery without a webhook domain:** the `tg-bot` function polls
 `getUpdates` every minute (offset persisted in the `meta` table). If you later
@@ -123,11 +126,49 @@ Function **variables** (Console → Functions → ⚙ Variables) — required:
 
 | Variable | On | Value |
 |---|---|---|
-| `TELEGRAM_BOT_TOKEN` | tg-bot + tg-processor | BotFather token |
+| `TELEGRAM_BOT_TOKEN` | tg-bot + tg-processor | BotFather token (**set** — bot `@eeetik_bot`) |
 | `TELEGRAM_WEBHOOK_SECRET` | tg-bot | `openssl rand -hex 32` (already set) |
-| `TELEGRAM_MINI_APP_URL` | tg-bot | Mini App public URL (Mini App button + /start) |
-| `TELEGRAM_STORAGE_CHAT_ID` | tg-processor | your numeric Telegram user id (fallback upload target for Mini App jobs) |
-| `APPWRITE_API_KEY` | both | Appwrite API key with tables/users/sessions scopes (pre-configured — rotate it, the console "standard" key expires!) |
+| `TELEGRAM_ALLOWED_USER_IDS` | tg-bot | comma-separated numeric ids allowed to use the bot (**set: `1673359993`** — delete the variable to make the bot public) |
+| `TELEGRAM_MINI_APP_URL` | tg-bot | Mini App public URL (Mini App button + /start) — set it after connecting your domain, see below |
+| `TELEGRAM_STORAGE_CHAT_ID` | tg-processor | your numeric Telegram user id, fallback upload target (**set: `1673359993`** — you must have pressed START on the bot once) |
+| `APPWRITE_BUCKET_ID` | tg-bot + tg-processor | permanent-media Storage bucket (**set: `6ad1172800034a06bcf5`**) |
+| `APPWRITE_API_KEY` | both | Appwrite API key with tables/users/sessions/storage scopes (pre-configured — rotate it, the console "standard" key expires!) |
+
+All of the above are **already configured live** (verified end-to-end: a test
+job downloaded, landed in the bucket, and was delivered to the owner chat).
+After rotating the API key, update the `APPWRITE_API_KEY` variable on **both**
+functions (Console → Functions → ⚙ Variables).
+
+### Connect your Cloudflare domain to Appwrite
+
+Appwrite does not take IPs to point A-records at; it gives you a **CNAME
+hostname** per resource in the console. With Cloudflare:
+
+1. **Site (Mini App) — subdomain (easiest):**
+   - Appwrite Console → **Sites → miniapp → Domains tab → Add domain**.
+   - Enter e.g. `app.yourdomain.com`, rule type **Active deployment**.
+   - Appwrite shows a **CNAME target** (an `*.appwrite.global`-style hostname).
+   - Cloudflare Dashboard → your domain → **DNS → Records → Add record**:
+     `Type CNAME` · `Name app` (or whatever subdomain) · `Target <copied
+     hostname>` · **Proxy status: DNS only (grey cloud)** — important, Appwrite
+     issues its own TLS certificate; the orange cloud breaks verification.
+   - Back in the console wait until the domain shows **Verified** (minutes to
+     a few hours). HTTPS is issued automatically by Appwrite.
+2. **Apex (`yourdomain.com`, no nameserver change):** same flow — Appwrite now
+   supports **CNAME flattening** (March 2026): add the domain in the console,
+   copy the CNAME (+ CAA, if Appwrite shows one) and create them in
+   Cloudflare; Cloudflare flattens apex CNAMEs automatically. Do **not** switch
+   nameservers to `ns1/ns2.appwrite.zone` — that would move your whole DNS
+   (mail, etc.) out of Cloudflare.
+3. **(Optional, instant bot responses) Function domain for the webhook:**
+   Console → **Functions → tg-bot → Domains → Add domain** with e.g.
+   `api.yourdomain.com`, add the same grey-cloud CNAME in Cloudflare, then set
+   the Telegram webhook to `https://api.yourdomain.com/` and delete the
+   every-minute schedule (Functions → tg-bot → Schedules) to stop the polling.
+4. **Wire the Mini App into the bot:** once the site domain is verified, set
+   function variable `TELEGRAM_MINI_APP_URL=https://app.yourdomain.com` on
+   `tg-bot` (Console → Functions → tg-bot → Variables). The **🎵 Open Mini App**
+   button appears under /start and the Mini App link opens inside Telegram.
 
 CI template: `docs/github-actions/deploy-appwrite.yml` (auto-deploys functions
 on every push to `main`; copy it into `.github/workflows/` — tokens need the

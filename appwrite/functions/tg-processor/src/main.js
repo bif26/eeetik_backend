@@ -15,7 +15,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { Bot, InputFile } from 'grammy';
+import { Bot, InputFile, InlineKeyboard } from 'grammy';
 import archiver from 'archiver';
 import TikTokApiDlModule from '@tobyg74/tiktok-api-dl';
 
@@ -30,6 +30,7 @@ const ENV = {
   apiKey: process.env.APPWRITE_API_KEY ?? '',
   botToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
   storageChatId: process.env.TELEGRAM_STORAGE_CHAT_ID ?? '',
+  bucketId: process.env.APPWRITE_BUCKET_ID ?? '',
   maxUploadMb: Number(process.env.TELEGRAM_MAX_UPLOAD_MB ?? 49),
 };
 const DATABASE_ID = 'eeetik';
@@ -77,6 +78,39 @@ async function upsertFileCache(key, data) {
     await updateRow('files', key.replace(/[^\w.-]/g, '_'), data);
   } catch {
     await createRow('files', { key, ...data });
+  }
+}
+
+// ─── Appwrite Storage bucket (permanent download links) ─────────────────
+const bucketViewUrl = (fileId) =>
+  `${ENV.endpoint}/storage/buckets/${ENV.bucketId}/files/${fileId}/view?project=${ENV.projectId}`;
+
+/** Best-effort upload; returns the Appwrite file id or '' when disabled/failed. */
+async function uploadToBucket(filePath, fileName, log) {
+  if (!ENV.bucketId || !ENV.apiKey) {
+    return '';
+  }
+  try {
+    const buffer = fs.readFileSync(filePath);
+    const form = new FormData();
+    form.append('fileId', 'unique()');
+    form.append('file', new Blob([buffer]), fileName);
+    const response = await fetch(`${ENV.endpoint}/storage/buckets/${ENV.bucketId}/files`, {
+      method: 'POST',
+      headers: {
+        'X-Appwrite-Project': ENV.projectId,
+        'X-Appwrite-Key': ENV.apiKey,
+      },
+      body: form,
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload?.message ?? `HTTP ${response.status}`);
+    }
+    return payload.$id ?? '';
+  } catch (err) {
+    log(`bucket upload skipped: ${String(err?.message ?? err).slice(0, 200)}`);
+    return '';
   }
 }
 
@@ -225,9 +259,11 @@ async function processJob(job, log) {
   // 1. file_id cache check (Telegram CDN reuse).
   const cacheKey = `${preview.uniqueId}:${kind}:${quality}`;
   let cachedFileId = '';
+  let cachedBucketFileId = '';
   try {
     const row = await getRow('files', cacheKey.replace(/[^\w.-]/g, '_'));
     cachedFileId = row.fileId ?? '';
+    cachedBucketFileId = row.appwriteFileId ?? '';
   } catch {
     /* miss */
   }
@@ -247,8 +283,11 @@ async function processJob(job, log) {
 
   // 2a. Cached file_id -> send instantly (no re-upload).
   if (cachedFileId) {
-    await sendByKind(bot, chatId, cachedFileId, kind, caption, preview, undefined, log);
-    await updateRow('jobs', jobId, { status: 'completed', fileId: cachedFileId });
+    const markup = cachedBucketFileId
+      ? new InlineKeyboard().url('⬇️ Save file', bucketViewUrl(cachedBucketFileId))
+      : undefined;
+    await sendByKind(bot, chatId, cachedFileId, kind, caption, preview, markup, log);
+    await updateRow('jobs', jobId, { status: 'completed', fileId: cachedFileId, appwriteFileId: cachedBucketFileId });
     await addHistory(job, preview, quality, kind, cachedFileId, 'completed');
     log(`job ${jobId}: delivered cached file_id (${cacheKey})`);
     return;
@@ -295,7 +334,14 @@ async function processJob(job, log) {
       thumbnail = kind === 'video' ? await tryFetchThumbnail(preview.thumbnailUrl) : undefined;
     }
 
-    const message = await uploadByKind(bot, chatId, filePath, kind, caption, preview, thumbnail);
+    // Permanent copy in the Appwrite Storage bucket (best effort) so the
+    // delivered message carries a non-expiring "Save file" button.
+    const bucketFileId = await uploadToBucket(filePath, path.basename(filePath), log);
+    const markup = bucketFileId
+      ? new InlineKeyboard().url('⬇️ Save file', bucketViewUrl(bucketFileId))
+      : undefined;
+
+    const message = await uploadByKind(bot, chatId, filePath, kind, caption, preview, thumbnail, markup);
     const fileId = extractFileId(message, kind);
     if (!fileId) {
       throw new Error('Telegram did not return a file_id');
@@ -303,11 +349,16 @@ async function processJob(job, log) {
     await upsertFileCache(cacheKey.replace(/[^\w.-]/g, '_'), {
       key: cacheKey,
       fileId,
+      appwriteFileId: bucketFileId,
       uniqueId: preview.uniqueId,
       kind,
       quality,
     });
-    await updateRow('jobs', jobId, { status: 'completed', fileId });
+    await updateRow('jobs', jobId, {
+      status: 'completed',
+      fileId,
+      appwriteFileId: bucketFileId,
+    });
     await addHistory(job, preview, quality, kind, fileId, 'completed');
     log(`job ${jobId}: uploaded + cached (${cacheKey})`);
   } finally {
@@ -336,8 +387,11 @@ async function addHistory(job, preview, quality, kind, fileId, status) {
   }
 }
 
-async function uploadByKind(bot, chatId, filePath, kind, caption, preview, thumbnail) {
+async function uploadByKind(bot, chatId, filePath, kind, caption, preview, thumbnail, replyMarkup) {
   const options = { caption, parse_mode: 'HTML' };
+  if (replyMarkup) {
+    options.reply_markup = replyMarkup;
+  }
   if (preview.duration) {
     options.duration = Math.round(preview.duration);
   }
@@ -357,8 +411,11 @@ async function uploadByKind(bot, chatId, filePath, kind, caption, preview, thumb
   return bot.api.sendVideo(chatId, new InputFile(filePath), { ...options, supports_streaming: true });
 }
 
-async function sendByKind(bot, chatId, fileId, kind, caption, preview, _extra, log) {
+async function sendByKind(bot, chatId, fileId, kind, caption, preview, replyMarkup, log) {
   const options = { caption, parse_mode: 'HTML' };
+  if (replyMarkup) {
+    options.reply_markup = replyMarkup;
+  }
   try {
     if (kind === 'audio') {
       await bot.api.sendAudio(chatId, fileId, {

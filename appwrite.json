@@ -17,7 +17,11 @@
       "logging": true,
       "specification": "s-0.5vcpu-1gb",
       "variables": [
-        { "key": "TELEGRAM_MINI_APP_URL", "value": "" }
+        { "key": "TELEGRAM_BOT_TOKEN", "value": "" },
+        { "key": "TELEGRAM_WEBHOOK_SECRET", "value": "" },
+        { "key": "TELEGRAM_ALLOWED_USER_IDS", "value": "" },
+        { "key": "TELEGRAM_MINI_APP_URL", "value": "" },
+        { "key": "APPWRITE_BUCKET_ID", "value": "" }
       ]
     },
     {
@@ -35,7 +39,10 @@
       "logging": true,
       "specification": "s-0.5vcpu-1gb",
       "variables": [
-        { "key": "TELEGRAM_STORAGE_CHAT_ID", "value": "" }
+        { "key": "TELEGRAM_BOT_TOKEN", "value": "" },
+        { "key": "TELEGRAM_STORAGE_CHAT_ID", "value": "" },
+        { "key": "APPWRITE_BUCKET_ID", "value": "" },
+        { "key": "TELEGRAM_MAX_UPLOAD_MB", "value": "49" }
       ]
     }
   ],
