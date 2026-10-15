@@ -1,0 +1,40 @@
+name: Deploy Appwrite functions
+
+# Automatic backend deploys to Appwrite on every push to main.
+#
+# Required repository secrets:
+#   APPWRITE_ENDPOINT   – e.g. https://fra.cloud.appwrite.io/v1
+#   APPWRITE_PROJECT_ID – Appwrite project id
+#   APPWRITE_API_KEY    – API key with functions.write + sites.write scopes
+#                         (create a long-lived key: Console → Integrations → API keys)
+#
+# Requires appwrite.json in the repo root (already present).
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Appwrite CLI
+        run: npm install -g appwrite-cli@latest
+
+      - name: Push functions
+        env:
+          APPWRITE_ENDPOINT: ${{ secrets.APPWRITE_ENDPOINT }}
+          APPWRITE_PROJECT_ID: ${{ secrets.APPWRITE_PROJECT_ID }}
+          APPWRITE_API_KEY: ${{ secrets.APPWRITE_API_KEY }}
+        run: |
+          appwrite push functions --all --force

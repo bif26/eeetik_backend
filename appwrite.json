@@ -1,0 +1,60 @@
+{
+  "projectId": "6ad11066001575dc5bc9",
+  "projectName": "eeetik",
+  "functions": [
+    {
+      "functionId": "tg-bot",
+      "name": "eeetik tg-bot",
+      "runtime": "node-22",
+      "path": "functions/tg-bot",
+      "entrypoint": "src/main.js",
+      "commands": "npm install",
+      "execute": ["any"],
+      "events": [],
+      "schedule": "*/1 * * * *",
+      "timeout": 300,
+      "enabled": true,
+      "logging": true,
+      "specification": "s-0.5vcpu-1gb",
+      "variables": [
+        { "key": "TELEGRAM_MINI_APP_URL", "value": "" }
+      ]
+    },
+    {
+      "functionId": "tg-processor",
+      "name": "eeetik tg-processor",
+      "runtime": "node-22",
+      "path": "functions/tg-processor",
+      "entrypoint": "src/main.js",
+      "commands": "npm install",
+      "execute": [],
+      "events": ["databases.eeetik.tables.jobs.rows.*.create"],
+      "schedule": "*/5 * * * *",
+      "timeout": 900,
+      "enabled": true,
+      "logging": true,
+      "specification": "s-0.5vcpu-1gb",
+      "variables": [
+        { "key": "TELEGRAM_STORAGE_CHAT_ID", "value": "" }
+      ]
+    }
+  ],
+  "sites": [
+    {
+      "siteId": "miniapp",
+      "name": "eeetik-miniapp",
+      "framework": "other",
+      "buildRuntime": "node-22",
+      "path": "../apps/miniapp",
+      "installCommand": "npm ci",
+      "buildCommand": "npm run build",
+      "outputDirectory": "build",
+      "installPaths": [],
+      "variables": [
+        { "key": "PUBLIC_APPWRITE_ENDPOINT", "value": "https://fra.cloud.appwrite.io/v1" },
+        { "key": "PUBLIC_APPWRITE_PROJECT_ID", "value": "6ad11066001575dc5bc9" },
+        { "key": "PUBLIC_FN_TG_BOT", "value": "tg-bot" }
+      ]
+    }
+  ]
+}

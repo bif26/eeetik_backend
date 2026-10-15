@@ -80,6 +80,65 @@ with 401.
 
 ---
 
+## Appwrite architecture (serverless, primary)
+
+The repo ships a fully **Appwrite-native stack** (`appwrite/` + `appwrite.json`)
+that runs entirely on Appwrite Cloud — no Render/Heroku/Redis needed:
+
+| Resource | Id | Role |
+|---|---|---|
+| TablesDB database | `eeetik` | tables: `users`, `jobs`, `files`, `meta`, `history` |
+| Function | `tg-bot` (every-minute schedule) | Telegram bot UX (/start, /help, link → preview → quality keyboard, callbacks, web_app_data) **+** Mini App API (`auth`, `metadata`, `prepare`, `jobs`, `download`, `history`, `settings`) |
+| Function | `tg-processor` (event + 5-min sweep) | row event `jobs.rows.*.create` → scrape → download to /tmp → upload to Telegram → cache `file_id` → deliver |
+| Site | `miniapp` | SvelteKit Mini App (daisyUI) |
+| Auth | Appwrite Auth | Telegram initData → HMAC-validated → Appwrite user `tg_<id>` + session |
+
+**How a download flows**
+
+1. User sends a TikTok link in chat (or pastes it in the Mini App).
+2. `tg-bot` returns a rich preview + quality keyboard; picking a quality creates
+   a `jobs` row (status `queued`).
+3. The row-create event triggers `tg-processor`: it downloads the media to the
+   function's /tmp, uploads it via the Bot API (49 MB guard, SD fallback,
+   Images ZIP via archiver), caches the returned `file_id` in the `files`
+   table, and marks the job `completed` (chat delivery + history row).
+4. The Mini App polls job status through `tg-bot` and gets a direct
+   `api.telegram.org/file/…` playback link for its own downloads.
+
+**Bot delivery without a webhook domain:** the `tg-bot` function polls
+`getUpdates` every minute (offset persisted in the `meta` table). If you later
+attach a function domain, the same function also accepts raw Telegram webhooks
+(`x-telegram-bot-api-secret-token` verified) — set the webhook to
+`https://<domain>/` and delete the schedule.
+
+### Deploy / operate
+
+```bash
+npm install -g appwrite-cli@latest
+appwrite login
+appwrite push functions --all   # uses appwrite.json
+```
+
+Function **variables** (Console → Functions → ⚙ Variables) — required:
+
+| Variable | On | Value |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | tg-bot + tg-processor | BotFather token |
+| `TELEGRAM_WEBHOOK_SECRET` | tg-bot | `openssl rand -hex 32` (already set) |
+| `TELEGRAM_MINI_APP_URL` | tg-bot | Mini App public URL (Mini App button + /start) |
+| `TELEGRAM_STORAGE_CHAT_ID` | tg-processor | your numeric Telegram user id (fallback upload target for Mini App jobs) |
+| `APPWRITE_API_KEY` | both | Appwrite API key with tables/users/sessions scopes (pre-configured — rotate it, the console "standard" key expires!) |
+
+CI template: `docs/github-actions/deploy-appwrite.yml` (auto-deploys functions
+on every push to `main`; copy it into `.github/workflows/` — tokens need the
+`workflow` permission for that path, see the Render section below).
+
+> The classic NestJS deployment (Render blueprint / Heroku dynos, this README
+> below) is still fully supported — both stacks share the same download
+> logic; the Appwrite stack needs no Redis/Mongo and runs on the free plan.
+
+---
+
 ## Deployment (Render free tier)
 
 The repo ships a **Render Blueprint** (`render.yaml`) with three services:

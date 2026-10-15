@@ -1,0 +1,11 @@
+{
+  "name": "eeetik-tg-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/main.js",
+  "dependencies": {
+    "@tobyg74/tiktok-api-dl": "^1.3.7",
+    "grammy": "^1.46.0"
+  }
+}
