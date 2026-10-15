@@ -31,6 +31,7 @@ const ENV = {
   botToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
   storageChatId: process.env.TELEGRAM_STORAGE_CHAT_ID ?? '',
   bucketId: process.env.APPWRITE_BUCKET_ID ?? '',
+  bucketMaxTotalMb: Number(process.env.BUCKET_MAX_TOTAL_MB ?? 1800),
   maxUploadMb: Number(process.env.TELEGRAM_MAX_UPLOAD_MB ?? 49),
 };
 const DATABASE_ID = 'eeetik';
@@ -135,6 +136,7 @@ function mapScrapeToPreview(url, content) {
   const author = asRecord(content?.author);
   const video = asRecord(content?.video);
   const music = asRecord(content?.music);
+  const stats = asRecord(content?.statistics);
   const imageUrls = Array.isArray(content?.images)
     ? content.images.filter((i) => typeof i === 'string')
     : [];
@@ -147,7 +149,14 @@ function mapScrapeToPreview(url, content) {
     videoHdUrl: firstString([content?.videoHD, video?.playAddr?.[0]]) ?? '',
     videoSdUrl: firstString([content?.videoSD, video?.downloadAddr?.[0]]) ?? '',
     audioUrl: firstString([music?.playUrl?.[0]]) ?? '',
+    musicTitle: firstString([music?.title, music?.name]) ?? '',
     imageUrls,
+    stats: {
+      views: toNumber(stats?.playCount),
+      likes: toNumber(stats?.likeCount),
+      comments: toNumber(stats?.commentCount),
+      shares: toNumber(stats?.shareCount),
+    },
     duration: toNumber(video?.duration ?? music?.duration),
   };
 }
@@ -188,7 +197,120 @@ function pickVideoUrl(preview, quality) {
   if (quality === 'sd' || quality === 'sd360') {
     return preview.videoSdUrl || preview.videoUrl;
   }
+  // hd / hd720 / file (original, uncompressed) all prefer the HD source.
   return preview.videoHdUrl || preview.videoUrl;
+}
+
+const QUALITY_LABELS = {
+  hd: 'HD 1080p',
+  hd720: 'HD 720p',
+  sd: 'SD 480p',
+  sd360: 'SD 360p',
+  audio: 'Audio MP3',
+  zip: 'Images ZIP',
+  zipwebp: 'Images WebP',
+  file: 'Video File',
+};
+
+function formatCompact(n) {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+}
+
+/** Rich delivery caption: description, author, quality, stats and song name. */
+function formatDeliveryCaption(preview, quality, extraNote) {
+  const stats = preview.stats ?? {};
+  const lines = [
+    `🎵 <b>${escapeHtml(preview.title || 'TikTok')}</b>`,
+    `👤 @${preview.uniqueId}${preview.authorName ? ` · ${escapeHtml(preview.authorName)}` : ''} · ${QUALITY_LABELS[quality] ?? String(quality).toUpperCase()}`,
+  ];
+  const statParts = [
+    stats.views ? `👁 ${formatCompact(stats.views)}` : '',
+    stats.likes ? `❤️ ${formatCompact(stats.likes)}` : '',
+    stats.comments ? `💬 ${formatCompact(stats.comments)}` : '',
+    stats.shares ? `🔁 ${formatCompact(stats.shares)}` : '',
+  ].filter(Boolean);
+  if (statParts.length) lines.push(statParts.join(' · '));
+  if (preview.musicTitle) lines.push(`🎵 ${escapeHtml(preview.musicTitle)}`);
+  if (preview.duration) lines.push(`⏱ ${Math.round(preview.duration)}s`);
+  if (extraNote) lines.push(escapeHtml(extraNote));
+  return lines.join('\n');
+}
+
+/** Inline keyboard under the delivered media: permanent save link + MP3 request. */
+function buildDeliveryMarkup(bucketFileId, urlHash, kind) {
+  const keyboard = new InlineKeyboard();
+  let hasButton = false;
+  if (bucketFileId && ENV.bucketId) {
+    keyboard.url('⬇️ Save file', bucketViewUrl(bucketFileId));
+    hasButton = true;
+  }
+  if (kind === 'video' || kind === 'file') {
+    if (hasButton) keyboard.row();
+    keyboard.text('🎵 Get MP3', `music:${urlHash}`);
+    hasButton = true;
+  }
+  return hasButton ? keyboard : undefined;
+}
+
+// ─── bucket capacity guard (stay on the free plan) ──────────────────────
+async function ensureBucketCapacity(incomingBytes, log) {
+  if (!ENV.bucketId || !ENV.apiKey || !ENV.bucketMaxTotalMb) return;
+  const maxBytes = ENV.bucketMaxTotalMb * 1024 * 1024;
+  try {
+    const bucket = await aw(`/storage/buckets/${ENV.bucketId}`);
+    let total = bucket.totalSize ?? 0;
+    if (total + incomingBytes <= maxBytes) return;
+    log(
+      `bucket at ${(total / 1048576).toFixed(0)} MB — pruning oldest files to stay under ${ENV.bucketMaxTotalMb} MB`,
+    );
+    const all = [];
+    for (let offset = 0; offset < 4000; offset += 100) {
+      const qs = `queries[]=${encodeURIComponent(JSON.stringify({ method: 'limit', values: [100] }))}`
+        + `&queries[]=${encodeURIComponent(JSON.stringify({ method: 'offset', values: [offset] }))}`;
+      const res = await aw(`/storage/buckets/${ENV.bucketId}/files?${qs}`);
+      const batch = res.files ?? [];
+      all.push(...batch);
+      if (batch.length < 100) break;
+    }
+    all.sort((a, b) => Date.parse(a.$createdAt) - Date.parse(b.$createdAt));
+    for (const file of all) {
+      if (total + incomingBytes <= maxBytes) return;
+      try {
+        await aw(`/storage/buckets/${ENV.bucketId}/files/${file.$id}`, 'DELETE');
+        total -= file.sizeOriginal ?? 0;
+      } catch {
+        /* already gone */
+      }
+    }
+    log(`bucket pruned to ${(total / 1048576).toFixed(0)} MB`);
+  } catch (err) {
+    log(`capacity check skipped: ${String(err?.message ?? err).slice(0, 120)}`);
+  }
+}
+
+// ─── WebP conversion (optional native dep, graceful fallback) ───────────
+let sharpState = undefined; // undefined = not loaded, false = unavailable
+async function getSharp() {
+  if (sharpState !== undefined) return sharpState || null;
+  try {
+    sharpState = (await import('sharp')).default ?? null;
+  } catch {
+    sharpState = false;
+  }
+  return sharpState || null;
+}
+
+async function toWebpBuffer(buffer, log) {
+  const sharp = await getSharp();
+  if (!sharp) return null;
+  try {
+    return await sharp(buffer).webp({ quality: 100, effort: 4 }).toBuffer();
+  } catch (err) {
+    log(`webp conversion failed: ${String(err?.message ?? err).slice(0, 120)}`);
+    return null;
+  }
 }
 
 async function downloadToBuffer(url, maxBytes) {
@@ -276,16 +398,12 @@ async function processJob(job, log) {
     );
   }
 
-  const caption = [
-    `🎵 <b>${escapeHtml(preview.title || 'TikTok')}</b>`,
-    `👤 @${preview.uniqueId} · ${quality.toUpperCase()}`,
-  ].join('\n');
+  const urlHash = crypto.createHash('sha1').update(job.url).digest('hex').slice(0, 12);
+  const caption = formatDeliveryCaption(preview, quality);
 
   // 2a. Cached file_id -> send instantly (no re-upload).
   if (cachedFileId) {
-    const markup = cachedBucketFileId
-      ? new InlineKeyboard().url('⬇️ Save file', bucketViewUrl(cachedBucketFileId))
-      : undefined;
+    const markup = buildDeliveryMarkup(cachedBucketFileId, urlHash, kind);
     await sendByKind(bot, chatId, cachedFileId, kind, caption, preview, markup, log);
     await updateRow('jobs', jobId, { status: 'completed', fileId: cachedFileId, appwriteFileId: cachedBucketFileId });
     await addHistory(job, preview, quality, kind, cachedFileId, 'completed');
@@ -295,6 +413,7 @@ async function processJob(job, log) {
 
   // 2b. Fresh download -> upload -> cache file_id.
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eeetik-'));
+  let captionNote = '';
   try {
     let filePath;
     let thumbnail;
@@ -302,13 +421,31 @@ async function processJob(job, log) {
       if (!preview.imageUrls?.length) {
         throw new Error('This post has no images to zip');
       }
+      const asWebp = quality === 'zipwebp';
       const maxImages = Math.min(preview.imageUrls.length, 30);
       const entries = [];
+      let converted = 0;
       for (let i = 0; i < maxImages; i += 1) {
         const buffer = await downloadToBuffer(preview.imageUrls[i], MAX_BYTES);
-        entries.push({ buffer, name: `${preview.uniqueId}-${i + 1}.jpg` });
+        let payload = buffer;
+        let ext = 'jpg';
+        if (asWebp) {
+          const webp = await toWebpBuffer(buffer, log);
+          if (webp) {
+            payload = webp;
+            ext = 'webp';
+            converted += 1;
+          }
+        }
+        entries.push({ buffer: payload, name: `${preview.uniqueId}-${i + 1}.${ext}` });
       }
       filePath = await zipFiles(entries);
+      if (asWebp && converted < maxImages) {
+        log(`job ${jobId}: webp fallback for ${maxImages - converted} image(s)`);
+      }
+      captionNote = asWebp && converted === 0
+        ? 'webp converter unavailable — original quality kept'
+        : '';
     } else {
       const sourceUrl = kind === 'audio' ? preview.audioUrl : pickVideoUrl(preview, quality);
       if (!sourceUrl) {
@@ -336,12 +473,20 @@ async function processJob(job, log) {
 
     // Permanent copy in the Appwrite Storage bucket (best effort) so the
     // delivered message carries a non-expiring "Save file" button.
-    const bucketFileId = await uploadToBucket(filePath, path.basename(filePath), log);
-    const markup = bucketFileId
-      ? new InlineKeyboard().url('⬇️ Save file', bucketViewUrl(bucketFileId))
-      : undefined;
+    let bucketFileId = '';
+    try {
+      await ensureBucketCapacity(fs.statSync(filePath).size, log);
+      bucketFileId = await uploadToBucket(filePath, path.basename(filePath), log);
+    } catch (bucketErr) {
+      log(`bucket upload skipped: ${bucketErr?.message ?? bucketErr}`);
+    }
+    const markup = buildDeliveryMarkup(bucketFileId, urlHash, kind);
 
-    const message = await uploadByKind(bot, chatId, filePath, kind, caption, preview, thumbnail, markup);
+    const message = await uploadByKind(
+      bot, chatId, filePath, kind,
+      captionNote ? formatDeliveryCaption(preview, quality, captionNote) : caption,
+      preview, thumbnail, markup,
+    );
     const fileId = extractFileId(message, kind);
     if (!fileId) {
       throw new Error('Telegram did not return a file_id');
@@ -401,12 +546,22 @@ async function uploadByKind(bot, chatId, filePath, kind, caption, preview, thumb
   if (kind === 'audio') {
     return bot.api.sendAudio(chatId, new InputFile(filePath), {
       ...options,
-      title: (preview.title || 'TikTok audio').slice(0, 60),
+      title: (preview.musicTitle || preview.title || 'TikTok audio').slice(0, 60),
       performer: preview.authorName || preview.uniqueId,
     });
   }
-  if (kind === 'zip') {
-    return bot.api.sendDocument(chatId, new InputFile(filePath), options);
+  if (kind === 'zip' || kind === 'file') {
+    // Documents are sent as-is: no Telegram video compression, original bytes.
+    const prettyName = kind === 'file'
+      ? `${String(preview.title || preview.uniqueId).replace(/[^\w\- ]+/g, '').trim().slice(0, 48) || preview.uniqueId}.mp4`
+      : path.basename(filePath);
+    const documentOptions = { ...options };
+    if (kind === 'file') {
+      // Without this flag Telegram sniffs the mp4 and re-registers the upload
+      // as a streamable `video` message instead of returning a document.
+      documentOptions.disable_content_type_detection = true;
+    }
+    return bot.api.sendDocument(chatId, new InputFile(filePath, prettyName), documentOptions);
   }
   return bot.api.sendVideo(chatId, new InputFile(filePath), { ...options, supports_streaming: true });
 }
@@ -420,10 +575,12 @@ async function sendByKind(bot, chatId, fileId, kind, caption, preview, replyMark
     if (kind === 'audio') {
       await bot.api.sendAudio(chatId, fileId, {
         ...options,
-        title: (preview.title || 'TikTok audio').slice(0, 60),
+        title: (preview.musicTitle || preview.title || 'TikTok audio').slice(0, 60),
       });
     } else if (kind === 'zip') {
       await bot.api.sendDocument(chatId, fileId, options);
+    } else if (kind === 'file') {
+      await bot.api.sendDocument(chatId, fileId, { ...options, disable_content_type_detection: true });
     } else {
       await bot.api.sendVideo(chatId, fileId, { ...options, supports_streaming: true });
     }
@@ -438,6 +595,11 @@ function extractFileId(message, kind) {
   if (!message) return '';
   if (kind === 'audio') return message.audio?.file_id ?? '';
   if (kind === 'zip') return message.document?.file_id ?? '';
+  if (kind === 'file') {
+    // Telegram may still present the upload as a streamable video; bytes are
+    // identical either way – accept both so the cache never misses.
+    return message.document?.file_id ?? message.video?.file_id ?? '';
+  }
   return message.video?.file_id ?? '';
 }
 
@@ -446,6 +608,14 @@ async function notifyChat(bot, chatId, text) {
     await bot.api.sendMessage(chatId, text, { parse_mode: 'HTML' });
   } catch {
     /* best effort */
+  }
+}
+
+function safeParse(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
   }
 }
 
@@ -470,7 +640,14 @@ async function processJobSafe(job, log, error) {
 
 // ─── entrypoint ──────────────────────────────────────────────────────────────
 export default async ({ req, res, log, error }) => {
-  const body = req.bodyJson ?? {};
+  // NOTE: the runtime's req.bodyJson getter THROWS on empty bodies (scheduled
+  // executions arrive with no body) – never access it unguarded.
+  let body = {};
+  try {
+    body = req.bodyJson ?? safeParse(req.bodyRaw) ?? {};
+  } catch {
+    body = safeParse(req.bodyRaw) ?? {};
+  }
   try {
     const candidate =
       body?.data?.$id ?? body?.row?.$id ?? body?.$id ?? body?.document?.$id ?? '';

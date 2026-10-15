@@ -33,7 +33,7 @@
       "commands": "npm install",
       "execute": [],
       "events": ["databases.eeetik.tables.jobs.rows.*.create"],
-      "schedule": "*/5 * * * *",
+      "schedule": "*/15 * * * *",
       "timeout": 900,
       "enabled": true,
       "logging": true,
@@ -42,6 +42,7 @@
         { "key": "TELEGRAM_BOT_TOKEN", "value": "" },
         { "key": "TELEGRAM_STORAGE_CHAT_ID", "value": "" },
         { "key": "APPWRITE_BUCKET_ID", "value": "" },
+        { "key": "BUCKET_MAX_TOTAL_MB", "value": "1800" },
         { "key": "TELEGRAM_MAX_UPLOAD_MB", "value": "49" }
       ]
     }

@@ -47,6 +47,8 @@ const QUALITIES = {
   sd360: { label: 'SD 360p', kind: 'video' },
   audio: { label: 'Audio MP3', kind: 'audio' },
   zip: { label: 'Images ZIP', kind: 'zip' },
+  zipwebp: { label: 'Images WebP', kind: 'zip' },
+  file: { label: 'Video File', kind: 'file' },
 };
 
 // ─── Appwrite REST helpers ───────────────────────────────────────────────────
@@ -159,6 +161,7 @@ function mapScrapeToPreview(url, content) {
     videoSdUrl: firstString([content?.videoSD, video?.downloadAddr?.[0]]) ?? '',
     videoWatermarkUrl: firstString([content?.videoWatermark]) ?? '',
     audioUrl: firstString([music?.playUrl?.[0]]) ?? '',
+    musicTitle: firstString([music?.title, music?.name, typeof music?.title === 'string' ? music.title : '']) ?? '',
     imageUrls,
     stats: {
       views: toNumber(stats?.playCount),
@@ -222,11 +225,12 @@ function mainKeyboard() {
   return keyboard;
 }
 
-function qualityKeyboard(uniqueId) {
+function qualityKeyboard(hash) {
   const keyboard = new InlineKeyboard();
-  keyboard.text('🎬 HD 1080p', `quality:${uniqueId}:hd`).text('🎥 HD 720p', `quality:${uniqueId}:hd720`).text('📱 SD 480p', `quality:${uniqueId}:sd`).row();
-  keyboard.text('📉 SD 360p', `quality:${uniqueId}:sd360`).text('🎧 Audio MP3', `quality:${uniqueId}:audio`).text('🖼️ Images ZIP', `quality:${uniqueId}:zip`).row();
-  keyboard.text('🔙 Back', `quality:${uniqueId}:back`);
+  keyboard.text('🎬 HD 1080p', `quality:${hash}:hd`).text('🎥 HD 720p', `quality:${hash}:hd720`).text('📱 SD 480p', `quality:${hash}:sd`).row();
+  keyboard.text('📉 SD 360p', `quality:${hash}:sd360`).text('🎧 Audio MP3', `quality:${hash}:audio`).text('🖼️ Images ZIP', `quality:${hash}:zip`).row();
+  keyboard.text('🌐 Images WebP', `quality:${hash}:zipwebp`).text('📄 Video File', `quality:${hash}:file`).text('🎵 Song MP3', `quality:${hash}:audio2`).row();
+  keyboard.text('🔙 Back', `quality:${hash}:back`);
   return keyboard;
 }
 
@@ -243,6 +247,7 @@ function formatCaption(preview) {
     stats.shares ? `🔁 ${formatCompact(stats.shares)}` : '',
   ].filter(Boolean);
   if (statParts.length) lines.push(statParts.join(' · '));
+  if (preview.musicTitle) lines.push(`🎵 ${escapeHtml(preview.musicTitle)}`);
   if (preview.duration) lines.push(`⏱ ${Math.round(preview.duration)}s`);
   if (preview.hashtags?.length) lines.push(preview.hashtags.map((h) => `#${h.replace(/^#/, '')}`).join(' '));
   return lines.join('\n');
@@ -370,9 +375,9 @@ async function registerBot(bot) {
     });
   });
 
-  bot.callbackQuery(/^quality:(\w+):(hd|hd720|sd|sd360|audio|zip)$/, async (ctx) => {
+  bot.callbackQuery(/^quality:(\w+):(hd|hd720|sd|sd360|audio|audio2|zip|zipwebp|file)$/, async (ctx) => {
     const [, hash, quality] = ctx.match;
-    const spec = QUALITIES[quality];
+    const spec = QUALITIES[quality === 'audio2' ? 'audio' : quality];
     try {
       await ctx.answerCallbackQuery();
       // Resolve the ORIGINAL video URL from the metadata cache (the callback
@@ -394,10 +399,11 @@ async function registerBot(bot) {
         return;
       }
       await ctx.editMessageText(`⏳ Preparing <b>${spec.label}</b>…`, { parse_mode: 'HTML' });
+      // Normalise the job quality (audio2 is just the keyboard duplicate of audio).
       await createRow('jobs', {
         url: jobUrl,
         uniqueId,
-        quality,
+        quality: quality === 'audio2' ? 'audio' : quality,
         kind: spec.kind,
         status: 'queued',
         chatId: String(ctx.chat?.id ?? ''),
@@ -415,6 +421,45 @@ async function registerBot(bot) {
       } catch {
         /* callback already answered */
       }
+    }
+  });
+
+  // "🎵 Get MP3" button under a delivered video: queue the song for this post.
+  bot.callbackQuery(/^music:(\w+)$/, async (ctx) => {
+    const [, hash] = ctx.match;
+    try {
+      let jobUrl = '';
+      let uniqueId = hash;
+      let musicTitle = '';
+      try {
+        const metaRow = await getRow('meta', hash);
+        const cached = JSON.parse(metaRow.payload);
+        jobUrl = cached.url ?? '';
+        uniqueId = cached.uniqueId ?? uniqueId;
+        musicTitle = cached.musicTitle ?? '';
+      } catch {
+        /* expired / missing */
+      }
+      if (!jobUrl) {
+        await ctx.answerCallbackQuery({ text: '⌛ Preview expired — send the link again', show_alert: true });
+        return;
+      }
+      await createRow('jobs', {
+        url: jobUrl,
+        uniqueId,
+        quality: 'audio',
+        kind: 'audio',
+        status: 'queued',
+        chatId: String(ctx.chat?.id ?? ''),
+        telegramUserId: String(ctx.from?.id ?? ''),
+        title: '',
+      });
+      await ctx.answerCallbackQuery({
+        text: musicTitle ? `🎵 ${musicTitle.slice(0, 55)}` : '🎵 Song queued as MP3',
+      });
+    } catch (err) {
+      logSafe(err);
+      await ctx.answerCallbackQuery({ text: 'Something went wrong, try again', show_alert: true }).catch(() => {});
     }
   });
 

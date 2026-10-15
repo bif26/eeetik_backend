@@ -88,9 +88,9 @@ that runs entirely on Appwrite Cloud — no Render/Heroku/Redis needed:
 | Resource | Id | Role |
 |---|---|---|
 | TablesDB database | `eeetik` | tables: `users`, `jobs`, `files`, `meta`, `history` |
-| Storage bucket | `6ad1172800034a06bcf5` ("rr") | permanent media copies — every delivered file also lands here; messages carry a non-expiring **⬇️ Save file** button (`/storage/.../view` link, bucket has `read("any")`) |
+| Storage bucket | `6ad1172800034a06bcf5` ("rr") | permanent media copies — every delivered file also lands here; messages carry a non-expiring **⬇️ Save file** button (`/storage/.../view` link, bucket has `read("any")`). Auto-prunes oldest files above `BUCKET_MAX_TOTAL_MB` (free-plan guard) |
 | Function | `tg-bot` (every-minute schedule) | Telegram bot UX (/start, /help, /id, link → preview → quality keyboard, callbacks, web_app_data) **+** Mini App API (`auth`, `metadata`, `prepare`, `jobs`, `download`, `history`, `settings`) |
-| Function | `tg-processor` (event + 5-min sweep) | row event `jobs.rows.*.create` → scrape → download to /tmp → upload to Appwrite bucket → upload to Telegram → cache `file_id` + `appwriteFileId` → deliver |
+| Function | `tg-processor` (event + 15-min sweep) | row event `jobs.rows.*.create` → scrape → download to /tmp → upload to Appwrite bucket → upload to Telegram → cache `file_id` + `appwriteFileId` → deliver |
 | Site | `miniapp` | SvelteKit Mini App (daisyUI) |
 | Auth | Appwrite Auth | Telegram initData → HMAC-validated → Appwrite user `tg_<id>` + session |
 
@@ -107,6 +107,32 @@ that runs entirely on Appwrite Cloud — no Render/Heroku/Redis needed:
 4. The Mini App polls job status through `tg-bot` and gets a direct
    `api.telegram.org/file/…` playback link (bucket view link preferred —
    it never expires).
+
+**Quality options (bot keyboard)**
+
+| Button | Delivers |
+|---|---|
+| 🎬 HD 1080p / 🎥 HD 720p / 📱 SD 480p / 📉 SD 360p | video (streamable, Bot API never recompresses — original bytes) |
+| 🎧 Audio MP3 / 🎵 Song MP3 | the post's song as audio, titled with the music name; also offered as a **🎵 Get MP3** button under every delivered video |
+| 🖼️ Images ZIP | original photos zipped (JPEG, up to 30) |
+| 🌐 Images WebP | photos converted to **full-quality WebP** (sharp, quality 100) and zipped — falls back to originals if the converter is unavailable |
+| 📄 Video File | the video as a true **document** (`disable_content_type_detection`, no streamable conversion) |
+
+Every delivery caption includes the post **description**, **author**, **stats**
+(views · likes · comments · shares), the **song name** and duration.
+
+**Free-plan guardrails (staying on Appwrite free)**
+
+- Bucket never exceeds `BUCKET_MAX_TOTAL_MB` (default `1800`, free tier 2 GB):
+  before each upload `tg-processor` prunes the oldest bucket files until the
+  new file fits. Lower it via the function variable if you want a bigger
+  safety margin.
+- `tg-processor` sweep runs every **15 min** (safety net only — real jobs are
+  event-triggered instantly).
+- `tg-bot` polls every minute (~43k executions/mo). Once your function domain
+  works, switch to the webhook and delete that schedule → near-zero idle
+  executions (see the domain section below).
+- Function specs are the smallest `s-0.5vcpu-1gb`; timeouts 300 s / 900 s.
 
 **Bot delivery without a webhook domain:** the `tg-bot` function polls
 `getUpdates` every minute (offset persisted in the `meta` table). If you later
@@ -132,6 +158,7 @@ Function **variables** (Console → Functions → ⚙ Variables) — required:
 | `TELEGRAM_MINI_APP_URL` | tg-bot | Mini App public URL (Mini App button + /start) — set it after connecting your domain, see below |
 | `TELEGRAM_STORAGE_CHAT_ID` | tg-processor | your numeric Telegram user id, fallback upload target (**set: `1673359993`** — you must have pressed START on the bot once) |
 | `APPWRITE_BUCKET_ID` | tg-bot + tg-processor | permanent-media Storage bucket (**set: `6ad1172800034a06bcf5`**) |
+| `BUCKET_MAX_TOTAL_MB` | tg-processor | bucket auto-prune ceiling, free-plan guard (**set: `1800`**) |
 | `APPWRITE_API_KEY` | both | Appwrite API key with tables/users/sessions/storage scopes (pre-configured — rotate it, the console "standard" key expires!) |
 
 All of the above are **already configured live** (verified end-to-end: a test
@@ -154,12 +181,20 @@ hostname** per resource in the console. With Cloudflare:
      issues its own TLS certificate; the orange cloud breaks verification.
    - Back in the console wait until the domain shows **Verified** (minutes to
      a few hours). HTTPS is issued automatically by Appwrite.
-2. **Apex (`yourdomain.com`, no nameserver change):** same flow — Appwrite now
-   supports **CNAME flattening** (March 2026): add the domain in the console,
-   copy the CNAME (+ CAA, if Appwrite shows one) and create them in
-   Cloudflare; Cloudflare flattens apex CNAMEs automatically. Do **not** switch
-   nameservers to `ns1/ns2.appwrite.zone` — that would move your whole DNS
-   (mail, etc.) out of Cloudflare.
+2. **Apex (`eeetik.app`) — the record that actually works:**
+   Appwrite does **not** give you IPs; a bare A record to the Fastly edge
+   (`151.101.x.x`) will fail certificate generation with
+   `Fastly error: unknown domain`. Use the **CNAME target** Appwrite shows:
+   - Appwrite Console → Sites → miniapp → Domains → click `eeetik.app` →
+     copy the exact **CNAME target** it displays.
+   - Cloudflare → DNS → **delete the `@` A records** (151.101.67.52,
+     151.101.131.52, 151.101.195.52, 151.101.3.52) and add
+     `CNAME · @ · <copied target> · **DNS only (grey cloud)**`.
+   - Back in Appwrite press **Retry** on the certificate. CAA on `eeetik.app`
+     already allows `letsencrypt.org` and `pki.goog` — no change needed.
+   - Cloudflare flattens apex CNAMEs automatically (CNAME flattening), and
+     Appwrite Sites supports it (March 2026) — no nameserver change, keep
+     everything else in Cloudflare.
 3. **(Optional, instant bot responses) Function domain for the webhook:**
    Console → **Functions → tg-bot → Domains → Add domain** with e.g.
    `api.yourdomain.com`, add the same grey-cloud CNAME in Cloudflare, then set
