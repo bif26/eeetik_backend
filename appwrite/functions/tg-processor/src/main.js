@@ -210,6 +210,7 @@ const QUALITY_LABELS = {
   zip: 'Images ZIP',
   zipwebp: 'Images WebP',
   file: 'Video File',
+  auto: 'Photos',
 };
 
 function formatCompact(n) {
@@ -238,20 +239,21 @@ function formatDeliveryCaption(preview, quality, extraNote) {
   return lines.join('\n');
 }
 
-/** Inline keyboard under the delivered media: permanent save link + MP3 request. */
-function buildDeliveryMarkup(bucketFileId, urlHash, kind) {
+/**
+ * Inline keyboard under the delivered media. Direct-to-chat only: no external
+ * links – just callback buttons for the song / other sizes.
+ */
+function buildDeliveryMarkup(urlHash, kind) {
   const keyboard = new InlineKeyboard();
-  let hasButton = false;
-  if (bucketFileId && ENV.bucketId) {
-    keyboard.url('⬇️ Save file', bucketViewUrl(bucketFileId));
-    hasButton = true;
-  }
   if (kind === 'video' || kind === 'file') {
-    if (hasButton) keyboard.row();
-    keyboard.text('🎵 Get MP3', `music:${urlHash}`);
-    hasButton = true;
+    keyboard.text('🎵 Get MP3', `music:${urlHash}`).text('🎬 More sizes', `more:${urlHash}`);
+    return keyboard;
   }
-  return hasButton ? keyboard : undefined;
+  if (kind === 'zip') {
+    keyboard.text('🎵 Get MP3', `music:${urlHash}`);
+    return keyboard;
+  }
+  return undefined;
 }
 
 // ─── bucket capacity guard (stay on the free plan) ──────────────────────
@@ -401,9 +403,49 @@ async function processJob(job, log) {
   const urlHash = crypto.createHash('sha1').update(job.url).digest('hex').slice(0, 12);
   const caption = formatDeliveryCaption(preview, quality);
 
+  // 1b. Photo posts -> deliver ALL post images as an album, straight into the
+  //     chat (explicit user request: automatic media images for photo posts).
+  //     Albums are not file_id-cached; re-downloading images is fast.
+  if (kind === 'images') {
+    if (!preview.imageUrls?.length) {
+      throw new Error('This post has no images to send');
+    }
+    const maxImages = Math.min(preview.imageUrls.length, 30);
+    let delivered = 0;
+    for (let offset = 0; offset < maxImages; offset += 10) {
+      const batch = [];
+      for (let i = offset; i < Math.min(offset + 10, maxImages); i += 1) {
+        const buffer = await downloadToBuffer(preview.imageUrls[i], MAX_BYTES);
+        batch.push({
+          type: 'photo',
+          media: new InputFile(buffer, `${preview.uniqueId}-${i + 1}.jpg`),
+          // Rich caption (desc / author / stats / music) on the first photo.
+          ...(delivered === 0 ? { caption, parse_mode: 'HTML' } : {}),
+        });
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await bot.api.sendMediaGroup(chatId, batch);
+      delivered += batch.length;
+    }
+    // Follow-up extras: the song + zip packs of the same post (callbacks only).
+    const extras = new InlineKeyboard()
+      .text('🎵 Get MP3', `music:${urlHash}`)
+      .text('📦 Images ZIP', `quality:${urlHash}:zip`)
+      .text('🌐 WebP ZIP', `quality:${urlHash}:zipwebp`);
+    await bot.api
+      .sendMessage(chatId, `🖼️ ${delivered} image(s) delivered${preview.musicTitle ? ` — song: ${escapeHtml(preview.musicTitle)}` : ''}`, {
+        reply_markup: extras,
+      })
+      .catch(() => {});
+    await updateRow('jobs', jobId, { status: 'completed' });
+    await addHistory(job, preview, quality, kind, '', 'completed');
+    log(`job ${jobId}: delivered ${delivered} image(s) as album`);
+    return;
+  }
+
   // 2a. Cached file_id -> send instantly (no re-upload).
   if (cachedFileId) {
-    const markup = buildDeliveryMarkup(cachedBucketFileId, urlHash, kind);
+    const markup = buildDeliveryMarkup(urlHash, kind);
     await sendByKind(bot, chatId, cachedFileId, kind, caption, preview, markup, log);
     await updateRow('jobs', jobId, { status: 'completed', fileId: cachedFileId, appwriteFileId: cachedBucketFileId });
     await addHistory(job, preview, quality, kind, cachedFileId, 'completed');
@@ -449,6 +491,9 @@ async function processJob(job, log) {
     } else {
       const sourceUrl = kind === 'audio' ? preview.audioUrl : pickVideoUrl(preview, quality);
       if (!sourceUrl) {
+        if (preview.imageUrls?.length) {
+          throw new Error('This is a photo post — tap 📦 Images ZIP on the preview to get the pictures');
+        }
         throw new Error(`No ${kind} source available for this post`);
       }
       let buffer;
@@ -471,8 +516,8 @@ async function processJob(job, log) {
       thumbnail = kind === 'video' ? await tryFetchThumbnail(preview.thumbnailUrl) : undefined;
     }
 
-    // Permanent copy in the Appwrite Storage bucket (best effort) so the
-    // delivered message carries a non-expiring "Save file" button.
+    // Permanent copy in the Appwrite Storage bucket (best effort) – the Mini
+    // App serves these via authenticated downloads.
     let bucketFileId = '';
     try {
       await ensureBucketCapacity(fs.statSync(filePath).size, log);
@@ -480,7 +525,7 @@ async function processJob(job, log) {
     } catch (bucketErr) {
       log(`bucket upload skipped: ${bucketErr?.message ?? bucketErr}`);
     }
-    const markup = buildDeliveryMarkup(bucketFileId, urlHash, kind);
+    const markup = buildDeliveryMarkup(urlHash, kind);
 
     const message = await uploadByKind(
       bot, chatId, filePath, kind,

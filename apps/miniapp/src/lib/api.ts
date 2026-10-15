@@ -33,6 +33,7 @@ export interface PreviewData {
   author: PreviewAuthor;
   stats: PreviewStats;
   hashtags: string[];
+  musicTitle?: string;
   availableFormats: {
     video?: FormatOption[];
     audio?: FormatOption[];
@@ -55,6 +56,7 @@ interface RawPreview {
   videoSdUrl?: string;
   videoWatermarkUrl?: string;
   audioUrl?: string;
+  musicTitle?: string;
   imageUrls?: string[];
   stats?: { views?: number; likes?: number; shares?: number; comments?: number };
   hashtags?: string[];
@@ -92,6 +94,7 @@ export const REQUEST_TYPE_LABELS: Record<string, string> = {
   sd360: 'SD 360p',
   audio: 'Audio MP3',
   zip: 'Images ZIP',
+  zipwebp: 'Images WebP',
 };
 
 function formatCompact(n: number): string {
@@ -129,13 +132,17 @@ function mapPreview(raw: RawPreview): PreviewData {
       comments: stats.comments != null ? formatCompact(stats.comments) : '—',
     },
     hashtags: raw.hashtags ?? [],
+    musicTitle: raw.musicTitle ?? '',
     availableFormats: {
       video: video.length ? video : undefined,
       audio: raw.audioUrl
         ? [{ id: 'audio', label: REQUEST_TYPE_LABELS.audio }]
         : undefined,
       images: imageUrls.length
-        ? [{ id: 'zip', label: REQUEST_TYPE_LABELS.zip }]
+        ? [
+            { id: 'zip', label: REQUEST_TYPE_LABELS.zip },
+            { id: 'zipwebp', label: REQUEST_TYPE_LABELS.zipwebp },
+          ]
         : undefined,
     },
     thumbnail: raw.thumbnailUrl || null,

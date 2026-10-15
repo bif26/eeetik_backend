@@ -3,17 +3,18 @@
  *
  * One function, two roles:
  *
- * 1. Telegram webhook (function domain URL):
- *    Telegram POSTs raw updates with the `x-telegram-bot-api-secret-token`
- *    header. Handles /start, /help, /download, plain links -> preview +
- *    quality keyboard, quality callbacks -> job row, web_app_data.
+ * 1. Telegram bot (every-minute schedule poll; webhook also supported when a
+ *    function domain exists). Commands: /start /help /download /status
+ *    /miniapp /id. Plain TikTok link -> DIRECT download: the media file is
+ *    delivered straight into the chat (photo posts arrive as an image album),
+ *    no external links, no quality-picker roundtrip.
  *
  * 2. Mini App / JSON action API (POST JSON {action, ...}):
  *    - auth      {initData}                 -> Appwrite user + session secret
  *    - metadata  {url}                      -> cached TikTok preview
  *    - prepare   {url, quality}             -> job row (requires Appwrite session)
  *    - jobs      {}                         -> my recent jobs (requires session)
- *    - download  {jobId}                    -> fresh Telegram file URL (session)
+ *    - download  {jobId}                    -> fresh file URL (session)
  *    - history   {}                         -> my download history (session)
  */
 import crypto from 'node:crypto';
@@ -212,16 +213,28 @@ function logSafe(err) {
   console.error('[tg-bot]', err?.message ?? err);
 }
 
-// ─── Bot UX (ported from NestJS BotService) ──────────────────────────────────
+// ─── Bot UX ─────────────────────────────────────────────────────────────
 const URL_REGEX = /https?:\/\/\S+/i;
-const BOT_LINK = (text) => text;
+const BOT_COMMANDS_VERSION = '2026-10-16.1';
 
 function mainKeyboard() {
   const keyboard = new InlineKeyboard();
   if (ENV.miniAppUrl) {
-    keyboard.webApp('🎵 Open Mini App', ENV.miniAppUrl);
+    keyboard.webApp('📱 Open Mini App', ENV.miniAppUrl);
   }
   keyboard.text('ℹ️ Help', 'help');
+  return keyboard;
+}
+
+/** Extras offered alongside a direct delivery (no external links). */
+function postExtrasKeyboard(hash, hasImages) {
+  const keyboard = new InlineKeyboard();
+  keyboard.text('🎵 Get MP3', `music:${hash}`);
+  if (hasImages) {
+    keyboard.text('📦 Images ZIP', `quality:${hash}:zip`).text('🌐 WebP ZIP', `quality:${hash}:zipwebp`);
+  } else {
+    keyboard.text('🎬 More sizes', `more:${hash}`);
+  }
   return keyboard;
 }
 
@@ -232,25 +245,6 @@ function qualityKeyboard(hash) {
   keyboard.text('🌐 Images WebP', `quality:${hash}:zipwebp`).text('📄 Video File', `quality:${hash}:file`).text('🎵 Song MP3', `quality:${hash}:audio2`).row();
   keyboard.text('🔙 Back', `quality:${hash}:back`);
   return keyboard;
-}
-
-function formatCaption(preview) {
-  const stats = preview.stats ?? {};
-  const lines = [
-    `🎵 <b>${escapeHtml(preview.title || 'TikTok video')}</b>`,
-    `👤 @${preview.uniqueId}${preview.authorName ? ` · ${escapeHtml(preview.authorName)}` : ''}`,
-  ];
-  const statParts = [
-    stats.views ? `👁 ${formatCompact(stats.views)}` : '',
-    stats.likes ? `❤️ ${formatCompact(stats.likes)}` : '',
-    stats.comments ? `💬 ${formatCompact(stats.comments)}` : '',
-    stats.shares ? `🔁 ${formatCompact(stats.shares)}` : '',
-  ].filter(Boolean);
-  if (statParts.length) lines.push(statParts.join(' · '));
-  if (preview.musicTitle) lines.push(`🎵 ${escapeHtml(preview.musicTitle)}`);
-  if (preview.duration) lines.push(`⏱ ${Math.round(preview.duration)}s`);
-  if (preview.hashtags?.length) lines.push(preview.hashtags.map((h) => `#${h.replace(/^#/, '')}`).join(' '));
-  return lines.join('\n');
 }
 
 function formatCompact(n) {
@@ -301,17 +295,15 @@ async function registerBot(bot) {
       [
         `👋 Welcome, <b>${escapeHtml(ctx.from?.first_name ?? 'friend')}</b>!`,
         '',
-        'I download TikTok videos, audio and photo sets for you — no watermark, straight into this chat.',
+        'Send me any TikTok link and I download it <b>directly into this chat</b> —',
+        'HD video, photo albums and the song as MP3. No watermark, no extra links.',
         '',
-        '<b>How to use</b>',
-        '1️⃣ Send me any TikTok link',
-        '2️⃣ Pick a quality',
-        '3️⃣ Receive your file here',
-        '',
-        ENV.miniAppUrl ? 'Or tap below to browse inside the Mini App 👇' : '',
-      ]
-        .filter(Boolean)
-        .join('\n'),
+        '<b>Commands</b>',
+        '/download &lt;link&gt; – download a TikTok post',
+        '/status – your recent downloads',
+        '/miniapp – open the Mini App',
+        '/help – full guide',
+      ].join('\n'),
       { parse_mode: 'HTML', reply_markup: mainKeyboard() },
     ),
   );
@@ -321,16 +313,58 @@ async function registerBot(bot) {
       [
         '<b>How eeetik works</b>',
         '',
-        '• Send a TikTok link (works with vm./vt. short links)',
-        '• Choose: HD 1080p / HD 720p / SD 480p / SD 360p / Audio MP3 / Images ZIP',
-        '• Files up to 49 MB are delivered right here',
-        `• Or use the Mini App${ENV.miniAppUrl ? '' : ' (ask the bot owner to set it up)'}`,
+        '• Send a TikTok link (vm./vt. short links work too) — no buttons needed:',
+        '   🎬 videos arrive as HD video, 🖼️ photo posts as an image album,',
+        '   🎵 and every delivery offers the song as MP3 with its real title.',
+        '• Each delivery also shows the post description, author, stats',
+        '   (views / likes / comments / shares) and the music name.',
+        '• Files up to 49 MB are delivered straight into this chat.',
+        '• Want a different size (720p / 480p / 360p) or a WebP image pack?',
+        '   Tap “🎬 More sizes” under the video — or use the Mini App.',
         '',
-        'Commands: /start · /help · /download <link>',
+        '<b>Commands</b>',
+        '/download &lt;link&gt; · /status · /miniapp · /help · /id',
       ].join('\n'),
-      { parse_mode: 'HTML' },
+      { parse_mode: 'HTML', reply_markup: mainKeyboard() },
     ),
   );
+
+  bot.command('miniapp', (ctx) => {
+    if (!ENV.miniAppUrl) {
+      return ctx.reply('📱 The Mini App is being set up — check back soon.');
+    }
+    return ctx.reply('Tap below to open the eeetik Mini App 👇', {
+      reply_markup: new InlineKeyboard().webApp('📱 Open Mini App', ENV.miniAppUrl),
+    });
+  });
+
+  bot.command('status', async (ctx) => {
+    try {
+      const result = await listTableRows('jobs', [
+        { method: 'equal', attribute: 'telegramUserId', values: [String(ctx.from?.id ?? '')] },
+        { method: 'orderDesc', attribute: '$createdAt' },
+        { method: 'limit', values: [6] },
+      ]);
+      const rows = result.rows ?? [];
+      if (!rows.length) {
+        await ctx.reply('📊 No downloads yet — send me a TikTok link to try!');
+        return;
+      }
+      const icon = { queued: '⏳', processing: '🔄', completed: '✅', failed: '❌' };
+      const lines = ['📊 <b>Your recent downloads</b>', ''];
+      for (const row of rows) {
+        const kindIcon = row.kind === 'audio' ? '🎵' : row.kind === 'zip' || row.kind === 'images' ? '🖼️' : '🎬';
+        lines.push(
+          `${icon[row.status] ?? '•'} ${kindIcon} ${escapeHtml((row.title || row.url).slice(0, 60))}\n` +
+          `      ${(row.quality ?? '').toUpperCase()} · ${row.status}`,
+        );
+      }
+      await ctx.reply(lines.join('\n'), { parse_mode: 'HTML' });
+    } catch (err) {
+      logSafe(err);
+      await ctx.reply('✅ Bot is up and running. (Could not load your download list right now.)');
+    }
+  });
 
   bot.command('download', async (ctx) => {
     const text = ctx.message?.text ?? '';
@@ -373,6 +407,19 @@ async function registerBot(bot) {
     await ctx.reply('👇 Send me a TikTok link or open the Mini App.', {
       reply_markup: mainKeyboard(),
     });
+  });
+
+  // "🎬 More sizes" under a delivered video: show the full quality keyboard.
+  bot.callbackQuery(/^more:(\w+)$/, async (ctx) => {
+    const [, hash] = ctx.match;
+    try {
+      await ctx.answerCallbackQuery();
+      await ctx.reply('Pick a size — it will be delivered right here:', {
+        reply_markup: qualityKeyboard(hash),
+      });
+    } catch (err) {
+      logSafe(err);
+    }
   });
 
   bot.callbackQuery(/^quality:(\w+):(hd|hd720|sd|sd360|audio|audio2|zip|zipwebp|file)$/, async (ctx) => {
@@ -500,6 +547,7 @@ async function pollOnce(log) {
     log('poll skipped: TELEGRAM_BOT_TOKEN is not configured');
     return { ok: false, handled: 0, reason: 'no-token' };
   }
+  await syncBotMeta(bot, log);
   const offset = await readOffset();
   let updates = [];
   try {
@@ -523,25 +571,54 @@ async function pollOnce(log) {
   return { ok: true, handled: updates.length };
 }
 
+/**
+ * Direct-download flow: no quality-picker roundtrip. A link immediately
+ * queues the best variant and the media is delivered straight into the chat:
+ *   - photo posts -> image album (+ MP3 / ZIP extras keyboard)
+ *   - videos      -> HD video (+ MP3 / more sizes extras keyboard)
+ */
 async function handleLink(ctx, url) {
-  const waitMsg = await ctx.reply('🔎 Fetching metadata…');
+  const waitMsg = await ctx.reply('🔎 Fetching post info…');
   try {
     const hash = crypto.createHash('sha1').update(url).digest('hex').slice(0, 12);
     const preview = await getCachedPreview(url, hash);
     await ctx.deleteMessage(waitMsg.message_id).catch(() => {});
-    const caption = formatCaption(preview);
-    // The keyboard carries the cache key; the callback resolves the video URL
-    // from the meta row (see quality callback handler).
-    const keyboard = qualityKeyboard(hash);
-    if (preview.thumbnailUrl) {
-      await ctx.replyWithPhoto(preview.thumbnailUrl, {
-        caption,
-        parse_mode: 'HTML',
-        reply_markup: keyboard,
+
+    const queueJob = async (quality, kind) =>
+      createRow('jobs', {
+        url,
+        uniqueId: preview.uniqueId,
+        quality,
+        kind,
+        status: 'queued',
+        chatId: String(ctx.chat?.id ?? ''),
+        telegramUserId: String(ctx.from?.id ?? ''),
+        title: preview.title ?? '',
       });
-    } else {
-      await ctx.reply(caption, { parse_mode: 'HTML', reply_markup: keyboard });
+
+    if (preview.imageUrls?.length) {
+      await queueJob('auto', 'images');
+      await ctx.reply(
+        `🖼️ <b>Photo post</b> — sending ${preview.imageUrls.length} image(s) here…\n` +
+        `👤 @${escapeHtml(preview.uniqueId)}${preview.musicTitle ? ` · 🎵 ${escapeHtml(preview.musicTitle)}` : ''}`,
+        { parse_mode: 'HTML', reply_markup: postExtrasKeyboard(hash, true) },
+      );
+      return;
     }
+
+    if (preview.videoUrl || preview.videoHdUrl || preview.videoSdUrl) {
+      await queueJob('hd', 'video');
+      await ctx.reply(
+        `⏳ Downloading <b>HD video</b> — it will arrive right here 🚀\n` +
+        `🎵 ${escapeHtml(preview.title || preview.musicTitle || 'TikTok video')}`,
+        { parse_mode: 'HTML', reply_markup: postExtrasKeyboard(hash, false) },
+      );
+      return;
+    }
+
+    await ctx.reply(
+      '⚠️ This post has no downloadable media — it may be private, removed or unsupported.',
+    );
   } catch (err) {
     logSafe(err);
     await ctx
@@ -557,6 +634,48 @@ function makeBot() {
   const bot = new Bot(ENV.botToken);
   registerBot(bot);
   return bot;
+}
+
+/**
+ * Registers the command list + Mini App menu button on Telegram (once per
+ * version, tracked in the meta table so scheduled runs stay cheap).
+ */
+async function syncBotMeta(bot, log) {
+  try {
+    let current = '';
+    try {
+      current = String((await getRow('meta', 'tg_commands_version')).payload ?? '');
+    } catch {
+      /* first run */
+    }
+    if (current === BOT_COMMANDS_VERSION) return;
+    await bot.api.setMyCommands([
+      { command: 'start', description: '👋 Start the bot' },
+      { command: 'download', description: '📥 Download a TikTok link' },
+      { command: 'status', description: '📊 Your recent downloads' },
+      { command: 'miniapp', description: '📱 Open the Mini App' },
+      { command: 'help', description: 'ℹ️ How to use' },
+      { command: 'id', description: '🪪 Show your IDs' },
+    ]);
+    if (ENV.miniAppUrl) {
+      await bot.api.setChatMenuButton({
+        menu_button: { type: 'web_app', text: 'Open eeetik', web_app: { url: ENV.miniAppUrl } },
+      });
+    }
+    try {
+      await getRow('meta', 'tg_commands_version');
+      await updateRow('meta', 'tg_commands_version', { payload: BOT_COMMANDS_VERSION });
+    } catch {
+      await createRow('meta', {
+        uniqueId: 'tg_commands_version',
+        url: 'internal://commands',
+        payload: BOT_COMMANDS_VERSION,
+      });
+    }
+    log('bot commands + menu button synced');
+  } catch (err) {
+    logSafe(err);
+  }
 }
 
 // ─── JSON action handlers ────────────────────────────────────────────────────
@@ -753,7 +872,15 @@ async function handleSettings(body, awUserId) {
 
 // ─── entrypoint ──────────────────────────────────────────────────────────────
 export default async ({ req, res, log, error }) => {
-  const body = req.bodyJson ?? safeParse(req.bodyRaw);
+  // NOTE: the runtime's req.bodyJson getter THROWS on empty bodies (scheduled
+  // executions arrive with no body) – never access it unguarded. Without this
+  // guard every scheduled poll crashes and the bot goes deaf.
+  let body = {};
+  try {
+    body = req.bodyJson ?? safeParse(req.bodyRaw) ?? {};
+  } catch {
+    body = safeParse(req.bodyRaw) ?? {};
+  }
   const headers = req.headers ?? {};
 
   try {
@@ -771,6 +898,7 @@ export default async ({ req, res, log, error }) => {
       }
       await bot.handleUpdate(body);
       return res.json({ ok: true });
+      // (syncBotMeta runs on the polling path; webhook mode stays lean)
     }
 
     // Role 1b: scheduled polling mode (every-minute schedule, no domain needed).

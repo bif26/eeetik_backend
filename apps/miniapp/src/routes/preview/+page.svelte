@@ -110,6 +110,9 @@
                                         <span class="badge badge-ghost">{Math.round(preview.duration)}s</span>
                                 {/if}
                         </div>
+                        {#if preview.musicTitle}
+                                <p class="text-sm opacity-80">🎵 {preview.musicTitle}</p>
+                        {/if}
 
                         <div class="stats stats-vertical bg-base-200 shadow-none sm:stats-horizontal">
                                 <div class="stat py-2">
